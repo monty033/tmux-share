@@ -18,3 +18,4 @@ __pycache__/
 
 # Writer worktrees live inside the repo; they are not content.
 .worktrees/
+/result
