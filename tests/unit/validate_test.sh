@@ -107,7 +107,13 @@ expect_reject validate_log_path 'a leading .. segment' '/../x.log'
 expect_reject validate_log_path 'a trailing .. segment' '/run/tmux-share/..'
 expect_reject validate_log_path 'a relative path' 'run/tmux-share/x.log'
 expect_reject validate_log_path 'a dot-relative path' './x.log'
-expect_reject validate_log_path 'a 65-character path' "$path65"
+# Paths are bounded by PATH_MAX, not by the identifier limit: a real log
+# path can legitimately exceed 64 characters, and the character rules are
+# what make it safe.
+long_path="/run/$(printf 'x%.0s' $(seq 1 200))/transcript.log"
+expect_accept validate_log_path 'a 200-character path' "$long_path"
+huge_path="/run/$(printf 'y%.0s' $(seq 1 4096)).log"
+expect_reject validate_log_path 'a path beyond PATH_MAX' "$huge_path"
 expect_reject validate_log_path 'a value containing *' '/run/*.log'
 
 # ---- arity -----------------------------------------------------------------

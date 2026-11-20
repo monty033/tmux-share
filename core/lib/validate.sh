@@ -60,6 +60,11 @@
 _VALIDATE_ALPHA='abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'
 _VALIDATE_ALNUM="${_VALIDATE_ALPHA}0123456789"
 _VALIDATE_MAXLEN=64
+# Paths are not names: 64 characters is a sane bound for an identifier but
+# not for a real path, and a caller's log file may sit anywhere. 4096 is
+# PATH_MAX on Linux; the character rules below still forbid anything a shell
+# would interpret.
+_VALIDATE_MAXPATH=4096
 VALIDATE_REASON=''
 
 # _validate_fail REASON: record the reason and return failure.
@@ -123,7 +128,14 @@ validate_log_path() {
         _validate_fail 'expected exactly one argument'
         return
     fi
-    _validate_length "$1" || return 1
+    if [ "${#1}" -lt 1 ]; then
+        _validate_fail 'empty value'
+        return
+    fi
+    if [ "${#1}" -gt "$_VALIDATE_MAXPATH" ]; then
+        _validate_fail "longer than $_VALIDATE_MAXPATH characters"
+        return
+    fi
     case $1 in
         /*) ;;
         *)
