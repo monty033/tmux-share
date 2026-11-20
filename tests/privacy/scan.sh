@@ -46,7 +46,11 @@ add_matches() {
 }
 
 list_files() {
-  find "$repo_root" \( -type d \( -name .git -o -name fixtures \) -prune \) -o -type f -print
+  # A worktree's .git is a FILE containing an absolute gitdir path, and it is
+  # pruned by name here as well as the directory form; otherwise every scan of
+  # a worktree reports the gitdir line as a leaked personal path.
+  find "$repo_root" \( \( -type d -o -type f \) -name .git -prune \) -o \
+       \( -type d -name fixtures -prune \) -o -type f -print
 }
 
 while IFS= read -r file; do
