@@ -1,0 +1,43 @@
+# tmux-share.tmpfiles: runtime files for tmpfiles.d(5).
+#
+# Install as /etc/tmpfiles.d/tmux-share.conf (or /usr/lib/tmpfiles.d/). The
+# group tmux-share comes from tmux-share.sysusers and must exist first; with
+# systemd, systemd-sysusers runs before systemd-tmpfiles-setup at boot.
+#
+# Fields: Type Path Mode User Group Age Argument. Every mode below is written
+# out in full. A "-" mode would mean "use the default", which for a created
+# directory is derived from the creator's umask; a boundary that depends on
+# the umask of whoever happened to run tmpfiles is not a boundary. Age is "-"
+# throughout so /run cleanup never ages these files away under a live server,
+# and the Argument is "-" because the files are created empty. All seven
+# fields are always written, so every rule has the same shape.
+# Nothing here is world-readable or world-writable: the "other" bits are zero
+# on every rule.
+#
+# THE SOCKET HAS NO RULE HERE, ON PURPOSE. tmux creates its socket itself,
+# owner-only (mode 0600, root), and connecting to a unix socket needs write
+# permission on it, so that is the boundary that keeps the reader group from
+# driving the shell even though it can traverse the directory the socket is in.
+# A tmpfiles rule that pre-created the socket path would have to pick a mode,
+# and any mode wider than tmux's own would undo that boundary before tmux ever
+# ran. Leaving the path alone means the only thing that can ever make the
+# socket is the process that owns it, with its own restrictive mode. The same reasoning covers the other runtime markers
+# (.notready-since, .rebuild-required): the scripts create them, root-owned.
+
+# The runtime directory: 0710 root:tmux-share. Group "x" without "r" means a
+# member of tmux-share can open a path it already knows inside the directory
+# (the transcript) but cannot list the directory, so it cannot enumerate what
+# else is there. Other: no access at all.
+d /run/tmux-share 0710 root tmux-share - -
+
+# The transcript, the reader's contract: 0640 root:tmux-share. Root writes it;
+# the group may read it and nothing more (no group write, so the reader cannot
+# alter or truncate the record).
+f /run/tmux-share/transcript.log 0640 root tmux-share - -
+
+# The advisory lock: 0600 root:root, and deliberately NOT group-readable.
+# flock(2) needs only read access to the file, so a lock the reader could open
+# is a lock the reader could hold, stalling the taps and the trimmer that wait
+# on it. It lives outside the runtime directory, in /run itself, so it is not
+# reachable through the directory the reader can traverse.
+f /run/tmux-share.lock 0600 root root - -

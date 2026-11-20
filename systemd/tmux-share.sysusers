@@ -1,0 +1,31 @@
+# tmux-share.sysusers: accounts for sysusers.d(5).
+#
+# Install as /etc/sysusers.d/tmux-share.conf (or /usr/lib/sysusers.d/).
+#
+# This file declares exactly one thing: the group `tmux-share`. That group is
+# the reader group. The tmpfiles rules (tmux-share.tmpfiles) give it
+# traverse-only access to the runtime directory and read-only access to the
+# transcript, and nothing else.
+#
+# THE READER ACCOUNT IS NOT CREATED HERE. Which account reads the transcript is
+# a deployment choice: the operator names an account that already exists on
+# their system, and this file must not assume or invent one. To grant access,
+# the operator runs, once, as root:
+#
+#     usermod -aG tmux-share <reader>
+#
+# (The reader must start a new login session for the membership to apply.)
+# To revoke access: `gpasswd -d <reader> tmux-share`.
+#
+# NO SERVICE ACCOUNT IS DECLARED, deliberately. Every tmux-share component (the
+# tmux server, the transcript tap, the watchdog, the trimmer) runs as root,
+# because the transcript is a record of what the root shell does and the
+# runtime files are root-owned. A dedicated user would only matter if some
+# component ran unprivileged, and none does. Declaring an unused user would
+# add an account to the host for no benefit; add one here only together with a
+# component that actually runs as it.
+#
+# Type  Name        ID
+# "-" lets the system pick a free GID (a system-range GID, as for any
+# sysusers group); nothing depends on a fixed number.
+g       tmux-share  -
