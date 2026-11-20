@@ -1,0 +1,371 @@
+#!/usr/bin/env bash
+# tmux-share-trim: keep the transcript bounded without tearing the byte stream.
+#
+# When the transcript is larger than TMUX_SHARE_MAX_BYTES, keep only its newest
+# TMUX_SHARE_MAX_BYTES bytes. Under or at the bound it does nothing at all: it
+# does not touch tmux, the file, or the not-ready marker.
+#
+# STEPS (in this order)
+#   1. Validate the session name, every path and the numeric limits. Any
+#      invalid value aborts the run before tmux is contacted.
+#   2. Take the shared lock (flock -w 20 -x). Busy: exit non-zero; the next
+#      pass retries.
+#   3. Log at or under the bound (or not created yet): exit 0, nothing changed.
+#   4. Otherwise:
+#        a. enumerate the session's panes (list-panes -s), bounded by timeout;
+#        b. close every tap with `pipe-pane -t PANE` (no command). A pane that
+#           vanished in the meantime is tolerated and skipped;
+#        c. copy the newest MAX bytes of the old file into a new file made with
+#           mktemp in the same directory, check that the write is complete,
+#           give it the old file's mode and ownership;
+#        d. mv it over the original (an atomic rename: readers see the whole
+#           old file or the whole new file, never a partial one);
+#        e. re-attach every pane that still exists with
+#           `pipe-pane -t PANE "exec $STAMP >> $LOG"`.
+#      No fsync is issued; "complete" means the byte count was verified, not
+#      that the data reached the disk.
+#   5. Re-attachment (4e) is done by an EXIT trap, so it runs on every exit
+#      path: success, a failed step, INT, TERM and HUP. If re-attaching
+#      fails, the script says
+#      "RECORDING STOPPED" on stderr, writes the rebuild marker (see below)
+#      and exits non-zero. It never leaves recording stopped silently.
+#      SIGKILL cannot be trapped; a killed trimmer can leave taps closed.
+#
+# NOT-READY SERVER
+#   "no server running", a missing socket ("No such file or directory") and
+#   "can't find session" (also "can't find window", which is what tmux says
+#   for `list-panes -s -t NAME`) mean the server is not up yet. They are
+#   handled with core/lib/notready.sh: the first observation excuses the pass
+#   (exit 0), inside the grace window the pass is still excused, beyond it the
+#   pass fails and names how long the server has been not ready. A successful
+#   enumeration clears the marker. Refusals ("Permission denied" and any other
+#   error), timeouts (rc 124/137) and wedges fail immediately, with no grace.
+#
+# KNOWN LOSS WINDOW (this script does NOT guarantee zero loss)
+#   * Bytes the pane produces between closing the taps (4b) and re-attaching
+#     them (4e) are not recorded. The window covers the copy and the rename,
+#     so it grows with the bound. Taps are closed first so the file stops
+#     growing before it is copied.
+#   * A filter (tmux-share-stamp) that still holds bytes it has read but not
+#     yet written when its tap is closed finishes writing them to the OLD file
+#     descriptor. If that happens after the copy was taken, or after the rename
+#     replaced the file, those bytes go to the unlinked old inode and are lost.
+#   * Panes created during the window get no tap from this script.
+#   * The kept region starts at an arbitrary byte, so the new file can begin in
+#     the middle of a line, a UTF-8 character or an escape sequence.
+#
+# EXIT STATUS
+#   0  successful trim, or nothing to do, or a not-ready pass excused by grace
+#   1  any failure (invalid setting, lock busy, tmux refusal/timeout, copy or
+#      rename failure, grace expired, re-attach failed)
+#
+# ENVIRONMENT (shared contract; each overridable)
+#   TMUX_SHARE_DIR=/run/tmux-share            directory of socket and transcript
+#   TMUX_SHARE_SESSION=tmux-hermes            tmux session name
+#   TMUX_SHARE_SOCK=$DIR/tmux.sock            tmux server socket
+#   TMUX_SHARE_LOG=$DIR/transcript.log        transcript the tap appends to
+#   TMUX_SHARE_LOCK=/run/tmux-share.lock      advisory lock
+#   TMUX_SHARE_NOTREADY_MARKER=$DIR/.notready-since
+#   TMUX_SHARE_REBUILD=$DIR/.rebuild-required tap rebuild still owed
+#   TMUX_SHARE_STAMP=<core/tmux-share-stamp>  the filter run behind each tap
+#   TMUX_SHARE_TMUX=tmux                      tmux binary
+#   TMUX_SHARE_TIMEOUT=timeout                bounds every tmux call
+#   TMUX_SHARE_MAX_BYTES=2097152              trim bound (positive integer)
+#   TMUX_SHARE_LIBDIR=<HERE/../lib>           where validate.sh/notready.sh live
+# Additional, optional:
+#   TMUX_SHARE_CALL_SECS=10                   per-tmux-call timeout, seconds
+#   TMUX_SHARE_LOCK_WAIT=20                   seconds to wait for the lock
+#
+# NOTES
+#   * The socket is handed to tmux through $TMUX ("SOCKET,0,0"), which tmux
+#     reads when no -S/-L is given, rather than through -S.
+#   * On a failed re-attach the pane ids that lost their tap are written, one
+#     per line, to TMUX_SHARE_REBUILD (mode 0600) so a later pass can rebuild
+#     them. This script never removes that marker.
+#   * Mode and ownership are copied with `chmod/chown --reference` (GNU
+#     coreutils). Run as root to preserve a different owner.
+
+set -eu
+
+PROG=tmux-share-trim
+
+say() { printf '%s: %s\n' "$PROG" "$*"; }
+warn() { printf '%s: %s\n' "$PROG" "$*" >&2; }
+die() {
+    warn "$*"
+    exit 1
+}
+
+# ---- configuration ----------------------------------------------------------
+HERE=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+PARENT=$(CDPATH= cd -- "$HERE/.." && pwd)
+
+DIR=${TMUX_SHARE_DIR:-/run/tmux-share}
+SESSION=${TMUX_SHARE_SESSION:-tmux-hermes}
+SOCK=${TMUX_SHARE_SOCK:-$DIR/tmux.sock}
+LOG=${TMUX_SHARE_LOG:-$DIR/transcript.log}
+LOCK=${TMUX_SHARE_LOCK:-/run/tmux-share.lock}
+REBUILD=${TMUX_SHARE_REBUILD:-$DIR/.rebuild-required}
+STAMP=${TMUX_SHARE_STAMP:-$PARENT/tmux-share-stamp}
+TMUX_BIN=${TMUX_SHARE_TMUX:-tmux}
+TIMEOUT=${TMUX_SHARE_TIMEOUT:-timeout}
+MAX=${TMUX_SHARE_MAX_BYTES-2097152} # set but empty is invalid, not defaulted
+CALL_SECS=${TMUX_SHARE_CALL_SECS:-10}
+LOCK_WAIT=${TMUX_SHARE_LOCK_WAIT:-20}
+LIBDIR=${TMUX_SHARE_LIBDIR:-$HERE/../lib}
+
+TMUX_SHARE_NOTREADY_MARKER=${TMUX_SHARE_NOTREADY_MARKER:-$DIR/.notready-since}
+export TMUX_SHARE_NOTREADY_MARKER
+
+# ---- state used by the exit trap -------------------------------------------
+CLOSED=()      # panes whose tap was, or may have been, closed
+VANISHED=' '   # space-delimited panes found gone; nothing to re-attach there
+TMPFILE=''     # the new transcript until it has been renamed into place
+SCRATCH=''     # scratch directory for captured tmux output
+T_OUT='' T_ERR='' T_RC=0 T_KIND=''
+
+# ---- helpers ----------------------------------------------------------------
+# oneline TEXT: first line, printable characters only, at most 200 of them.
+oneline() {
+    printf '%s\n' "$1" | head -n 1 | tr -cd '[:print:]' | cut -c 1-200
+}
+
+# tmux_run ARGS...: run tmux bounded by timeout; set T_OUT, T_ERR, T_RC.
+# The lock descriptor is closed for the child.
+tmux_run() {
+    T_RC=0
+    TMUX="$SOCK,0,0" "$TIMEOUT" -k 2 "$CALL_SECS" "$TMUX_BIN" "$@" \
+        >"$SCRATCH/out" 2>"$SCRATCH/err" 9>&- || T_RC=$?
+    T_OUT=$(head -c 65536 -- "$SCRATCH/out")
+    T_ERR=$(head -c 4096 -- "$SCRATCH/err")
+    return 0
+}
+
+# classify: set T_KIND from T_RC and T_ERR to one of
+#   ok | vanished | notready | timeout | refused
+classify() {
+    if [ "$T_RC" -eq 0 ]; then
+        T_KIND=ok
+        return 0
+    fi
+    case $T_RC in
+        124 | 137)
+            T_KIND=timeout
+            return 0
+            ;;
+    esac
+    case $T_ERR in
+        *"can't find pane"*) T_KIND=vanished ;;
+        *"no server running"* | *"(No such file or directory)"* | \
+            *"can't find session"* | *"can't find window"*)
+            T_KIND=notready
+            ;;
+        *) T_KIND=refused ;;
+    esac
+    return 0
+}
+
+# notready_elapsed: seconds since the marker was stamped, or "an unknown time".
+notready_elapsed() {
+    local clock=${TMUX_SHARE_UPTIME_FILE:-/proc/uptime}
+    local start='' now='' rest=''
+    { IFS= read -r start <"$TMUX_SHARE_NOTREADY_MARKER"; } 2>/dev/null || true
+    { IFS=' ' read -r now rest <"$clock"; } 2>/dev/null || true
+    now=${now%%.*}
+    if [[ $start =~ ^[0-9]{1,10}$ && $now =~ ^[0-9]{1,10}$ ]] \
+        && [ "$((10#$now))" -ge "$((10#$start))" ]; then
+        printf '%ss' "$((10#$now - 10#$start))"
+    else
+        printf 'an unknown time'
+    fi
+}
+
+# handle_notready WHAT: apply the grace policy; always exits.
+handle_notready() {
+    if notready_check; then
+        say "tmux server not ready during $1; pass excused (inside grace)"
+        exit 0
+    fi
+    die "tmux server not ready for $(notready_elapsed), beyond the grace: $(oneline "$T_ERR")"
+}
+
+# tmux_failed WHAT: report a non-ok, non-notready result and exit.
+tmux_failed() {
+    case $T_KIND in
+        timeout) die "tmux $1 timed out after ${CALL_SECS}s (wedged?)" ;;
+        *) die "tmux $1 failed (rc=$T_RC): $(oneline "$T_ERR")" ;;
+    esac
+}
+
+# reopen_taps: re-attach every closed pane that still exists. Returns 1 and
+# records the rebuild marker if any pane could not be re-attached.
+reopen_taps() {
+    local pane cmd="exec $STAMP >> $LOG" failed=() reopened=0
+    for pane in "${CLOSED[@]}"; do
+        case $VANISHED in
+            *" $pane "*) continue ;;
+        esac
+        tmux_run pipe-pane -t "$pane" "$cmd"
+        classify
+        case $T_KIND in
+            ok) reopened=$((reopened + 1)) ;;
+            vanished) warn "pane $pane vanished before re-attach; nothing to record" ;;
+            *)
+                failed+=("$pane")
+                warn "re-attach of pane $pane failed (rc=$T_RC, $T_KIND): $(oneline "$T_ERR")"
+                ;;
+        esac
+    done
+    if [ "${#failed[@]}" -gt 0 ]; then
+        if ! (umask 077 && printf '%s\n' "${failed[@]}" >"$REBUILD") 2>/dev/null; then
+            warn "could not write the rebuild marker"
+        fi
+        warn "RECORDING STOPPED on ${#failed[@]} pane(s): ${failed[*]}; taps must be rebuilt"
+        return 1
+    fi
+    say "re-attached $reopened tap(s)"
+    return 0
+}
+
+on_exit() {
+    local rc=$?
+    trap - EXIT
+    if [ -n "$TMPFILE" ]; then
+        rm -f -- "$TMPFILE" || true
+    fi
+    if [ "${#CLOSED[@]}" -gt 0 ]; then
+        if ! reopen_taps; then
+            [ "$rc" -ne 0 ] || rc=1
+        fi
+    fi
+    if [ -n "$SCRATCH" ]; then
+        rm -rf -- "$SCRATCH" || true
+    fi
+    exit "$rc"
+}
+
+trap on_exit EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# ---- 1. validate (nothing below touches tmux until this is done) -------------
+if [ ! -r "$LIBDIR/validate.sh" ] || [ ! -r "$LIBDIR/notready.sh" ]; then
+    die "cannot read the helper libraries in the library directory"
+fi
+# shellcheck source=../lib/validate.sh
+. "$LIBDIR/validate.sh"
+# shellcheck source=../lib/notready.sh
+. "$LIBDIR/notready.sh"
+
+# check_value NAME VALIDATOR VALUE: the value itself is never echoed.
+check_value() {
+    if ! "$2" "$3"; then
+        die "invalid $1: $(validate_reason)"
+    fi
+}
+
+positive_int() {
+    case $2 in
+        '' | 0* | *[!0-9]*) die "$1 must be a positive integer" ;;
+    esac
+    if [ "${#2}" -gt 15 ]; then
+        die "$1 is too long"
+    fi
+}
+
+check_value 'session name' validate_session_name "$SESSION"
+check_value 'log path' validate_log_path "$LOG"
+check_value 'socket path' validate_log_path "$SOCK"
+check_value 'lock path' validate_log_path "$LOCK"
+check_value 'rebuild marker path' validate_log_path "$REBUILD"
+check_value 'stamp path' validate_log_path "$STAMP"
+positive_int TMUX_SHARE_MAX_BYTES "$MAX"
+positive_int TMUX_SHARE_CALL_SECS "$CALL_SECS"
+positive_int TMUX_SHARE_LOCK_WAIT "$LOCK_WAIT"
+if [ ! -f "$STAMP" ] || [ ! -x "$STAMP" ]; then
+    die "stamp filter is not an executable file"
+fi
+
+# ---- 2. lock ----------------------------------------------------------------
+if ! exec 9>>"$LOCK"; then
+    die "cannot open the lock file"
+fi
+if ! flock -w "$LOCK_WAIT" -x 9; then
+    warn "lock busy after ${LOCK_WAIT}s; another pass holds it, the next pass will retry"
+    exit 1
+fi
+
+# ---- 3. nothing to do? --------------------------------------------------------
+if [ ! -e "$LOG" ] && [ ! -L "$LOG" ]; then
+    say "no transcript yet; nothing to trim"
+    exit 0
+fi
+if [ -L "$LOG" ] || [ ! -f "$LOG" ]; then
+    die "transcript is not a regular file"
+fi
+SIZE=$(wc -c <"$LOG")
+SIZE=${SIZE//[[:space:]]/}
+if [ "$SIZE" -le "$MAX" ]; then
+    say "transcript is $SIZE bytes, within the $MAX byte bound; nothing to do"
+    exit 0
+fi
+
+# ---- 4a. enumerate panes ------------------------------------------------------
+SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/$PROG.XXXXXX") || die "cannot create a scratch directory"
+
+tmux_run list-panes -s -t "$SESSION" -F '#{pane_id}'
+classify
+case $T_KIND in
+    ok) ;;
+    notready) handle_notready "enumeration" ;;
+    *) tmux_failed "list-panes" ;;
+esac
+server_ready || warn "cannot clear the not-ready marker"
+
+PANES=()
+while IFS= read -r line; do
+    pane=''
+    read -r pane _ <<<"$line" || true
+    [ -n "$pane" ] || continue
+    if [[ ! $pane =~ ^%[0-9]{1,9}$ ]] || ! validate_token "$pane"; then
+        die "tmux returned an unusable pane id"
+    fi
+    PANES+=("$pane")
+done <<<"$T_OUT"
+
+# ---- 4b. close every tap ------------------------------------------------------
+# From here on the EXIT trap re-attaches whatever was closed.
+for pane in ${PANES[@]+"${PANES[@]}"}; do
+    CLOSED+=("$pane")
+    tmux_run pipe-pane -t "$pane"
+    classify
+    case $T_KIND in
+        ok) ;;
+        vanished)
+            warn "pane $pane vanished before its tap was closed; skipping it"
+            VANISHED="$VANISHED$pane "
+            ;;
+        notready) handle_notready "tap close" ;;
+        *) tmux_failed "pipe-pane (close $pane)" ;;
+    esac
+done
+
+# ---- 4c. copy the newest bytes into a new file beside the original --------------
+TMPFILE=$(mktemp "$LOG.XXXXXX") || die "cannot create a temporary file beside the transcript"
+tail -c "$MAX" -- "$LOG" >"$TMPFILE" || die "cannot read the newest bytes of the transcript"
+GOT=$(wc -c <"$TMPFILE")
+GOT=${GOT//[[:space:]]/}
+if [ "$GOT" -ne "$MAX" ]; then
+    die "incomplete copy: wrote $GOT of $MAX bytes; transcript left as it was"
+fi
+chmod --reference="$LOG" -- "$TMPFILE" || die "cannot copy the mode to the new file"
+chown --reference="$LOG" -- "$TMPFILE" || die "cannot copy the ownership to the new file"
+
+# ---- 4d. atomic replace -----------------------------------------------------
+mv -f -- "$TMPFILE" "$LOG" || die "cannot rename the new file over the transcript"
+TMPFILE=''
+say "trimmed transcript from $SIZE to $MAX bytes"
+
+# ---- 4e. re-attach: done by the EXIT trap on this and every other path -----------
+exit 0
