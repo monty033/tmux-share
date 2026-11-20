@@ -295,6 +295,36 @@ else
     check_pass
 fi
 
+# ---- 6b. every tmux call is bounded ----------------------------------------
+# A reviewed requirement was that no tmux call can hang: each one goes through
+# tmux_bounded, which wraps it in `timeout`. Nothing checked that. Dropping the
+# wrapper from a single call site passed every suite, so this check asserts the
+# only direct invocation of the tmux program is inside tmux_bounded itself.
+_direct_tmux_hits() {
+    local dir=$1
+    [ -d "$dir" ] || return 0
+    awk '
+        /^[[:space:]]*tmux_bounded[[:space:]]*\(\)/ { in_wrapper = 1 }
+        in_wrapper && /^}/ { in_wrapper = 0; next }
+        in_wrapper { next }
+        /^[[:space:]]*#/ { next }
+        { print FILENAME ":" FNR ":" $0 }
+    ' "$dir"/* 2>/dev/null \
+        | grep -E '(^|[;&|(]|[[:space:]])\$?\{?"?\$?TMUX"?([[:space:]]|$)|(^|[;&|(]|[[:space:]])tmux([[:space:]]|$)' \
+        | grep -v 'tmux_bounded' || true
+}
+check_begin no-unbounded-tmux-call
+unbounded=$(_direct_tmux_hits "$BINDIR")
+if [ ! -d "$BINDIR" ]; then
+    check_skip "script directory $BINDIR does not exist"
+elif [ -n "$unbounded" ]; then
+    n=$(printf '%s\n' "$unbounded" | grep -c '' || true)
+    check_fail "tmux invoked outside tmux_bounded ($n occurrence(s)); the call has no timeout bound: ${unbounded%%$'\n'*}"
+else
+    check_pass
+fi
+
+
 # ---- 7. systemd units ------------------------------------------------------
 # _unit_lines FILE: the unit file followed by its drop-ins, in order.
 _unit_lines() {
