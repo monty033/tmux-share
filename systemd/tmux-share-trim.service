@@ -1,0 +1,16 @@
+# tmux-share-trim.service: one pass that keeps the transcript within its size bound.
+# Started by tmux-share-trim.timer; it is not a daemon.
+
+[Unit]
+# Description: shown by systemctl status and in the journal.
+Description=tmux-share transcript trimmer
+# After: order behind the server so the socket exists; no Requires=/Wants=, so a pass never starts or restarts the server.
+After=tmux-share-server.service
+
+[Service]
+# Type=oneshot: one short pass per activation; no RemainAfterExit, so the next timer tick runs it again.
+Type=oneshot
+# EnvironmentFile: contract variables (stamp path, lib dir, size bound); required, a missing file fails loudly.
+EnvironmentFile=/etc/tmux-share/env
+# ExecStart: the trimmer takes the shared lock and exits 0 when the log is within its bound.
+ExecStart=/usr/local/bin/tmux-share-trim

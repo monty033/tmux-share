@@ -1,0 +1,17 @@
+# tmux-share-trim.timer: runs tmux-share-trim.service about every five minutes.
+
+[Unit]
+# Description: shown by systemctl list-timers.
+Description=Run the tmux-share transcript trimmer every five minutes
+
+[Timer]
+# OnBootSec: first pass 5 min after boot; OnUnitActiveSec alone never fires if the service has not run yet.
+OnBootSec=5min
+# OnUnitActiveSec: then 5 min after each pass last became active.
+OnUnitActiveSec=5min
+# AccuracySec: systemd's default is 1min, so the pass could drift by up to a minute.
+AccuracySec=1s
+
+[Install]
+# WantedBy: timers.target activates the timer at boot.
+WantedBy=timers.target

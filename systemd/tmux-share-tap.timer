@@ -1,0 +1,17 @@
+# tmux-share-tap.timer: runs tmux-share-tap.service about every 20 seconds.
+
+[Unit]
+# Description: shown by systemctl list-timers.
+Description=Run the tmux-share watchdog every 20 seconds
+
+[Timer]
+# OnBootSec: first pass 20 s after boot; OnUnitActiveSec alone never fires if the service has not run yet.
+OnBootSec=20s
+# OnUnitActiveSec: then 20 s after each pass last became active.
+OnUnitActiveSec=20s
+# AccuracySec: systemd's default is 1min, which stretches "every 20 s" to up to 80 s.
+AccuracySec=1s
+
+[Install]
+# WantedBy: timers.target activates the timer at boot.
+WantedBy=timers.target

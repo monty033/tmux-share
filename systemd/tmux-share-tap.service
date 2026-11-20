@@ -1,0 +1,16 @@
+# tmux-share-tap.service: one watchdog pass that keeps the transcript tap attached.
+# Started by tmux-share-tap.timer; it is not a daemon.
+
+[Unit]
+# Description: shown by systemctl status and in the journal.
+Description=tmux-share watchdog (keeps the transcript tap attached)
+# After: order behind the server so the socket exists; no Requires=/Wants=, so a pass never starts or restarts the server.
+After=tmux-share-server.service
+
+[Service]
+# Type=oneshot: one short pass per activation; no RemainAfterExit, so the next timer tick runs it again.
+Type=oneshot
+# EnvironmentFile: contract variables (stamp path, lib dir, session); required, a missing file fails loudly.
+EnvironmentFile=/etc/tmux-share/env
+# ExecStart: idempotent and never pipe-pane -o; a server that is not up yet is the script's own grace logic.
+ExecStart=/usr/local/bin/tmux-share-watchdog
