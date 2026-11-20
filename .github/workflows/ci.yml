@@ -30,7 +30,7 @@ jobs:
           rc=$?
           tail -40 /tmp/suite.log
           if [ "$rc" -ne 0 ]; then
-            grep -E '^(FAIL|failed:|  *FAIL)|Error:|error:' /tmp/suite.log | head -20 | while IFS= read -r line; do
+            grep -E '^(FAIL|failed:|  *FAIL)|Error:|error:|systemd-analyze|SKIP' /tmp/suite.log | head -20 | while IFS= read -r line; do
               printf '::error::%s\n' "$line"
             done
             exit "$rc"
