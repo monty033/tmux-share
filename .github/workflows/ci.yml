@@ -1,0 +1,22 @@
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # tmux is not guaranteed on the image; the suites use the fake tmux in
+      # tests/stubs and skip the one check that wants a real one, so adding it
+      # only widens coverage rather than being required.
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq tmux
+      - run: bash tests/run-all.sh
