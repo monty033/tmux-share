@@ -1,0 +1,292 @@
+#!/usr/bin/env bash
+# tmux-share-render: render the deployment's own files from the environment
+# contract, so a host without Nix can be configured without editing templates
+# by hand.
+#
+# USAGE
+#   tmux-share-render tmux-config   tmux configuration, to stdout
+#   tmux-share-render units         systemd unit files, to stdout, one per
+#                                   unit, separated by a line that is exactly
+#                                   "# ---"
+#   tmux-share-render paths         shell-quoted KEY='value' lines for the
+#                                   contract variables, for EnvironmentFile=
+#   tmux-share-render --help        this summary
+#
+# RULES
+#   * Every contract value is validated with core/lib/validate.sh before
+#     anything is printed. A bad value makes the renderer exit 1 naming the
+#     variable (never echoing the value) with nothing on stdout, so a rendered
+#     file can never contain an unvalidated value. Validation covers all
+#     variables in every mode, so the three outputs always agree.
+#   * Inputs come from the environment only. Nothing is read from the host:
+#     no files, no commands, no probing. The two path defaults that the
+#     contract derives from the script's location (LIBDIR, STAMP) and the
+#     directory the unit files point at for the watchdog and trimmer are
+#     computed lexically from this script's own path and $PWD; a path that
+#     fails validation (for example one containing '..' or longer than 64
+#     characters) is refused rather than rendered.
+#   * Nothing is evaluated. Values are only ever printed.
+#
+# ENVIRONMENT (shared contract, all overridable)
+#   TMUX_SHARE_DIR=/run/tmux-share        TMUX_SHARE_SESSION=tmux-hermes
+#   TMUX_SHARE_SOCK=$DIR/tmux.sock        TMUX_SHARE_LOG=$DIR/transcript.log
+#   TMUX_SHARE_LOCK=/run/tmux-share.lock
+#   TMUX_SHARE_NOTREADY_MARKER=$DIR/.notready-since
+#   TMUX_SHARE_REBUILD=$DIR/.rebuild-required
+#   TMUX_SHARE_STAMP=<core>/tmux-share-stamp   TMUX_SHARE_TMUX=tmux
+#   TMUX_SHARE_TIMEOUT=timeout            TMUX_SHARE_MAX_BYTES=2097152
+#   TMUX_SHARE_LIBDIR=<core>/lib
+#   TMUX_SHARE_SHELL   optional; the operator's shell inside the session
+set -eu
+
+prog=tmux-share-render
+
+usage() {
+    cat <<'EOF'
+usage: tmux-share-render MODE
+
+modes:
+  tmux-config   print the tmux configuration to stdout
+  units         print systemd unit files to stdout, separated by "# ---"
+  paths         print shell-quoted KEY=VALUE lines for EnvironmentFile=
+  --help        show this help
+
+Values come from the TMUX_SHARE_* environment variables; any value that
+fails validation is refused and nothing is printed.
+EOF
+}
+
+die() {
+    printf '%s: %s\n' "$prog" "$1" >&2
+    exit 1
+}
+
+mode=${1:-}
+case $mode in
+    --help|-h|help)
+        usage
+        exit 0
+        ;;
+    tmux-config|units|paths)
+        if [ "$#" -ne 1 ]; then
+            usage >&2
+            exit 2
+        fi
+        ;;
+    *)
+        usage >&2
+        exit 2
+        ;;
+esac
+
+# ---- locate ourselves (lexically; no filesystem reads) ----------------------
+src=${BASH_SOURCE[0]}
+here=${src%/*}
+[ "$here" != "$src" ] || here=.
+
+abs=$here
+case $abs in
+    /*) ;;
+    *) abs=$PWD/$abs ;;
+esac
+while :; do
+    case $abs in
+        *'/./'*) abs=${abs/\/.\//\/} ;;
+        *) break ;;
+    esac
+done
+abs=${abs%/.}
+core=${abs%/*}
+
+: "${TMUX_SHARE_LIBDIR:=$core/lib}"
+
+# shellcheck source=../lib/validate.sh
+. "${TMUX_SHARE_LIBDIR}/validate.sh"
+
+# ---- contract defaults ------------------------------------------------------
+: "${TMUX_SHARE_DIR:=/run/tmux-share}"
+: "${TMUX_SHARE_SESSION:=tmux-hermes}"
+: "${TMUX_SHARE_SOCK:=$TMUX_SHARE_DIR/tmux.sock}"
+: "${TMUX_SHARE_LOG:=$TMUX_SHARE_DIR/transcript.log}"
+: "${TMUX_SHARE_LOCK:=/run/tmux-share.lock}"
+: "${TMUX_SHARE_NOTREADY_MARKER:=$TMUX_SHARE_DIR/.notready-since}"
+: "${TMUX_SHARE_REBUILD:=$TMUX_SHARE_DIR/.rebuild-required}"
+: "${TMUX_SHARE_STAMP:=$core/tmux-share-stamp}"
+: "${TMUX_SHARE_TMUX:=tmux}"
+: "${TMUX_SHARE_TIMEOUT:=timeout}"
+: "${TMUX_SHARE_MAX_BYTES:=2097152}"
+TMUX_SHARE_SHELL=${TMUX_SHARE_SHELL:-}
+bindir=$abs
+
+# ---- validate everything before printing anything ---------------------------
+check_path() {
+    if ! validate_log_path "${!1}"; then
+        die "$1 rejected: $VALIDATE_REASON"
+    fi
+}
+
+check_command() {
+    if ! validate_token "${!1}"; then
+        die "$1 rejected: $VALIDATE_REASON"
+    fi
+    # '%' is a pane-id character for validate_token but a specifier inside a
+    # unit file; '-' as the first character would be read as an option.
+    case ${!1} in
+        *%*) die "$1 rejected: contains '%'" ;;
+        -*) die "$1 rejected: must not start with '-'" ;;
+    esac
+}
+
+for v in TMUX_SHARE_DIR TMUX_SHARE_SOCK TMUX_SHARE_LOG TMUX_SHARE_LOCK \
+    TMUX_SHARE_NOTREADY_MARKER TMUX_SHARE_REBUILD TMUX_SHARE_STAMP \
+    TMUX_SHARE_LIBDIR; do
+    check_path "$v"
+done
+if [ -n "$TMUX_SHARE_SHELL" ]; then
+    check_path TMUX_SHARE_SHELL
+fi
+if ! validate_session_name "$TMUX_SHARE_SESSION"; then
+    die "TMUX_SHARE_SESSION rejected: $VALIDATE_REASON"
+fi
+check_command TMUX_SHARE_TMUX
+check_command TMUX_SHARE_TIMEOUT
+case $TMUX_SHARE_MAX_BYTES in
+    ''|0*|*[!0123456789]*)
+        die "TMUX_SHARE_MAX_BYTES rejected: must be a positive integer without leading zeros"
+        ;;
+esac
+if [ "${#TMUX_SHARE_MAX_BYTES}" -gt 12 ]; then
+    die "TMUX_SHARE_MAX_BYTES rejected: longer than 12 digits"
+fi
+if [ "$mode" = units ]; then
+    if ! validate_log_path "$bindir"; then
+        die "bin directory (this script's location) rejected: $VALIDATE_REASON"
+    fi
+fi
+
+# Contract variables, in the order they are written out.
+keys=(TMUX_SHARE_DIR TMUX_SHARE_SESSION TMUX_SHARE_SOCK TMUX_SHARE_LOG
+    TMUX_SHARE_LOCK TMUX_SHARE_NOTREADY_MARKER TMUX_SHARE_REBUILD
+    TMUX_SHARE_STAMP TMUX_SHARE_TMUX TMUX_SHARE_TIMEOUT TMUX_SHARE_MAX_BYTES
+    TMUX_SHARE_LIBDIR)
+
+# ---- renderers --------------------------------------------------------------
+render_tmux_config() {
+    cat <<EOF
+# tmux configuration for the dedicated tmux-share server.
+# Rendered by tmux-share-render from the TMUX_SHARE_* environment; do not edit
+# by hand, re-render instead.
+
+# exit-empty on: systemd owns the lifecycle. When the last session goes the
+# server exits and systemd restarts it, rather than tmux lingering half-alive
+# with nothing to monitor.
+set -g exit-empty on
+EOF
+    if [ -n "$TMUX_SHARE_SHELL" ]; then
+        cat <<EOF
+
+# default-shell: the operator's shell, so attaching gives the shell they
+# expect instead of whatever the account database says for root.
+# Set with -g on purpose: this server is dedicated to tmux-share, so a global
+# setting cannot leak into anyone else's tmux and no per-session scoping is
+# needed.
+set -g default-shell $TMUX_SHARE_SHELL
+EOF
+    fi
+    cat <<EOF
+
+# new-session -d: create the monitored session when the server starts, so the
+# transcript tap and the operator's attach always have a session to find.
+new-session -d -s $TMUX_SHARE_SESSION
+EOF
+}
+
+env_lines() {
+    local k
+    for k in "${keys[@]}"; do
+        printf 'Environment="%s=%s"\n' "$k" "${!k}"
+    done
+}
+
+render_units() {
+    cat <<EOF
+# tmux-share.service
+[Unit]
+Description=tmux-share dedicated tmux server ($TMUX_SHARE_SESSION)
+After=local-fs.target
+
+[Service]
+Type=simple
+$(env_lines)
+# Install the tmux-config output at the -f path below.
+# -D keeps the server in the foreground so systemd tracks it directly.
+ExecStart=$TMUX_SHARE_TMUX -D -S $TMUX_SHARE_SOCK -f /etc/tmux-share/tmux.conf
+# exit-empty on makes the server exit when its session ends; systemd owns the
+# lifecycle, so bring it back.
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+# ---
+# tmux-share-watchdog.service
+[Unit]
+Description=tmux-share watchdog (keeps the transcript tap attached)
+After=tmux-share.service
+
+[Service]
+Type=oneshot
+$(env_lines)
+ExecStart=$bindir/tmux-share-watchdog
+# ---
+# tmux-share-watchdog.timer
+[Unit]
+Description=Run the tmux-share watchdog every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+
+[Install]
+WantedBy=timers.target
+# ---
+# tmux-share-trim.service
+[Unit]
+Description=tmux-share transcript trimmer
+After=tmux-share.service
+
+[Service]
+Type=oneshot
+$(env_lines)
+ExecStart=$bindir/tmux-share-trim
+# ---
+# tmux-share-trim.timer
+[Unit]
+Description=Run the tmux-share transcript trimmer every five minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
+render_paths() {
+    local k
+    for k in "${keys[@]}"; do
+        # Validated values contain no single quote; the quoting is belt and
+        # braces for EnvironmentFile= and for a shell reading the block.
+        printf "%s='%s'\n" "$k" "${!k}"
+    done
+    if [ -n "$TMUX_SHARE_SHELL" ]; then
+        printf "TMUX_SHARE_SHELL='%s'\n" "$TMUX_SHARE_SHELL"
+    fi
+}
+
+case $mode in
+    tmux-config) render_tmux_config ;;
+    units) render_units ;;
+    paths) render_paths ;;
+esac
