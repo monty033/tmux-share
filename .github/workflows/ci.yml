@@ -20,5 +20,18 @@ jobs:
           tmux -V
           python3 --version
 
+      # The suite output is re-emitted as workflow annotations on failure.
+      # Annotations are readable by anyone through the public API, so a failing
+      # run can be diagnosed without downloading logs, which need a token.
       - name: Run every suite
-        run: just test
+        run: |
+          set +e
+          just test > /tmp/suite.log 2>&1
+          rc=$?
+          tail -40 /tmp/suite.log
+          if [ "$rc" -ne 0 ]; then
+            grep -E '^(FAIL|failed:|  *FAIL)|Error:|error:' /tmp/suite.log | head -20 | while IFS= read -r line; do
+              printf '::error::%s\n' "$line"
+            done
+            exit "$rc"
+          fi
