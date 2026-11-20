@@ -241,6 +241,19 @@ if command -v systemd-analyze >/dev/null 2>&1; then
     if [ -n "$vout" ]; then
         while IFS= read -r line; do
             [ -z "$line" ] && continue
+            # Only complaints about OUR units count. `systemd-analyze verify`
+            # pulls in the units these depend on and reports on those too: on
+            # Ubuntu it complains about stock units such as
+            # /usr/lib/systemd/system/xfs_scrub_all.service ("Support for option
+            # CPUAccounting= has been removed"), naming paths that DO exist, so
+            # the excuse below could not absorb them. Another package's unit is
+            # not a defect in this repository.
+            who=${line%%:*}
+            who=${who#./}
+            case " $ALL_UNITS " in
+                *" $who "*) ;;
+                *) continue ;;
+            esac
             named=$(printf '%s' "$line" | grep -oE '/[^ ：:,]+' | head -1 || true)
             if [ -n "$named" ] && [ ! -e "$named" ]; then
                 continue    # the unit points at something not installed here
