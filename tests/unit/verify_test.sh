@@ -138,6 +138,19 @@ case $out in
     *) bad 'the toggle check is the one that failed' ;;
 esac
 
+# ---------------------------------------------------------------- case 5b
+# A tmux call that bypasses the bounded wrapper has no timeout. This passed
+# every suite until the mutation suite removed the wrapper and nothing noticed.
+T5b=$TMP/unbounded; build_good_tree "$T5b"
+make_socket "$T5b/deploy/tmux.sock" 600 >/dev/null 2>&1 || true
+printf '#!/usr/bin/env bash\npanes=$("$TMUX" list-panes -s -t sess)\n' > "$T5b/bin/tmux-share-watchdog"
+rc=0; out=$(run_verify "$T5b" 2>&1) || rc=$?
+if [ "$rc" -ne 0 ]; then ok 'a tmux call outside the bounded wrapper fails the run'; else bad 'a tmux call outside the bounded wrapper fails the run'; fi
+case $out in
+    *no-unbounded-tmux-call*) ok 'the unbounded-call check is the one that failed' ;;
+    *) bad 'the unbounded-call check is the one that failed' ;;
+esac
+
 # ---------------------------------------------------------------- case 6
 T6=$TMP/badstamp; build_good_tree "$T6"
 make_socket "$T6/deploy/tmux.sock" 600 >/dev/null 2>&1 || true
