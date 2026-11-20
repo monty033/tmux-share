@@ -1,6 +1,6 @@
 # Installing on NixOS
 
-Import the module through the flake (`nixosModules.default`, also exported as `nixosModules.tmux-share`), then set `services.tmux-share.enable = true`. The module mirrors the unit files in `systemd/` and the shared environment contract in `../CORE-CONTRACT.md`.
+Import the module through the flake (`nixosModules.default`, also exported as `nixosModules.tmux-share`), then set `services.tmux-share.enable = true`. The module mirrors the unit files in `systemd/` and the environment contract documented in [`operations.md`](operations.md).
 
 ## Module options
 
