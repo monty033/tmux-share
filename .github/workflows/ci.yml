@@ -22,8 +22,3 @@ jobs:
 
       - name: Run every suite
         run: just test
-
-      - name: Show the failure detail on a red run
-        if: failure()
-        run: |
-          just test || true
