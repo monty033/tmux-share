@@ -4,7 +4,8 @@ kind: tool
 version: 0.1.0
 manifest_version: 2
 requires_hermes: ">=0.21.3"
-author: Bernie
+author: Patrick
+license: MIT
 description: >
   Reads a root-owned tmux transcript that the agent has no way to control.
   Three read-only tools (tmux_share_status, tmux_share_tail, tmux_share_read)

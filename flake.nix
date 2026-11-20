@@ -73,6 +73,7 @@
             meta = {
               description = "tmux-share: transcript-recording tmux server with a read-only reader group";
               platforms = lib.platforms.linux;
+              license = lib.licenses.mit;
             };
           }
           ''

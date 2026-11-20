@@ -61,3 +61,7 @@ just lint       # shell syntax, shellcheck if installed, python compile
 just selftest   # disposable end-to-end run against a scratch tmux server
 just verify     # inspect a live deployment, change nothing
 ```
+
+## License
+
+MIT. See [LICENSE](LICENSE).
