@@ -6,26 +6,24 @@ name: ci
 
 jobs:
   test:
-    # The runner declares "ubuntu-latest:docker://node:18-bullseye", so the
-    # container image comes from the label itself. Naming a second image here
-    # would be ignored at best; asking for a "docker" label matched no runner at
-    # all and the job sat in waiting indefinitely.
-    runs-on: ubuntu-latest
+    # This host's runner advertises "ubuntu-latest:docker://node:18-bullseye" and
+    # "nixos:host". The host label is used because the tools the suites need
+    # (tmux, python3, flock, just) are already in /run/current-system/sw/bin
+    # there, so the job installs nothing: every install step that can fail on a
+    # container's network is a way for CI to fail for reasons unrelated to the
+    # change under test.
+    runs-on: nixos
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install the tools the suites use
+      - name: Report the tool versions in use
         run: |
-          apt-get update
-          apt-get install -y --no-install-recommends tmux python3 util-linux curl ca-certificates
+          export PATH="/run/current-system/sw/bin:$PATH"
           tmux -V
           python3 --version
-
-      - name: Install just
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh \
-            | bash -s -- --to /usr/local/bin --tag 1.51.0
           just --version
 
       - name: Run every suite
-        run: just test
+        run: |
+          export PATH="/run/current-system/sw/bin:$PATH"
+          just test
