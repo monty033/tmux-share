@@ -30,7 +30,8 @@ jobs:
           rc=$?
           tail -60 /tmp/suite.log
           if [ "$rc" -ne 0 ]; then
-            folded=$(tail -60 /tmp/suite.log | tr '\n' '|' | cut -c1-65000)
+            folded=$(grep -aE 'FAIL|systemd|SKIP|not executable|No such file' /tmp/suite.log \
+                       | head -60 | tr '\n' '|' | cut -c1-60000)
             printf '::error::%s\n' "$folded"
             exit "$rc"
           fi
