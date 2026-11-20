@@ -36,7 +36,9 @@ LOG=${TMUX_SHARE_LOG:-$DIR/transcript.log}
 LOCK=${TMUX_SHARE_LOCK:-/run/tmux-share.lock}
 TMUX_SHARE_NOTREADY_MARKER=${TMUX_SHARE_NOTREADY_MARKER:-$DIR/.notready-since}
 REBUILD=${TMUX_SHARE_REBUILD:-$DIR/.rebuild-required}
-STAMP=${TMUX_SHARE_STAMP:-$HERE/../tmux-share-stamp}
+# Canonicalise: the validator rejects a ".." segment, and this default is
+#      \"$(dirname \"$HERE\")/tmux-share-stamp\" written the short way.
+STAMP=${TMUX_SHARE_STAMP:-$(CDPATH= cd -- "$HERE/.." && pwd -P)/tmux-share-stamp}
 TMUX=${TMUX_SHARE_TMUX:-tmux}
 TIMEOUT=${TMUX_SHARE_TIMEOUT:-timeout}
 LIBDIR=${TMUX_SHARE_LIBDIR:-$HERE/../lib}

@@ -57,7 +57,13 @@
             fi
             PATH="${runtimePath}:\$PATH"
             export PATH
-            exec "$out/lib/tmux-share/core/bin/${s}" "\$@"
+            # Bind the install root at build time and escape it for the
+            # heredoc, so the wrapper never depends on an unset variable: an
+            # unescaped runtime variable here expands to nothing during the
+            # build and every command in this package fails with ENOENT.
+            root=${placeholder "out"}
+            export TMUX_SHARE_LIBDIR="\$root/lib/tmux-share/core/lib"
+            exec "\$root/lib/tmux-share/core/bin/${s}" "\$@"
             WRAPPER
             chmod 0755 "$out/bin/${s}"
           '';
