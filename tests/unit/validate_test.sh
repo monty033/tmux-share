@@ -112,6 +112,14 @@ expect_reject validate_log_path 'a dot-relative path' './x.log'
 # what make it safe.
 long_path="/run/$(printf 'x%.0s' $(seq 1 200))/transcript.log"
 expect_accept validate_log_path 'a 200-character path' "$long_path"
+
+# A program path is a path when it contains a slash, and a bare command name
+# otherwise. Both must survive a long prefix, because the deployment's
+# store or install prefix is not the caller's choice.
+expect_accept validate_exec_path 'a bare command name' 'tmux'
+expect_accept validate_exec_path 'an absolute program path' "$long_path"
+expect_reject validate_exec_path 'a command name containing a semicolon' 'tm;ux'
+expect_reject validate_exec_path 'a command name containing a space' 'tm ux'
 huge_path="/run/$(printf 'y%.0s' $(seq 1 4096)).log"
 expect_reject validate_log_path 'a path beyond PATH_MAX' "$huge_path"
 expect_reject validate_log_path 'a value containing *' '/run/*.log'

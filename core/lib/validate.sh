@@ -159,6 +159,44 @@ validate_log_path() {
     return 0
 }
 
+# validate_exec_path VALUE: a program to execute, given either as an absolute
+# path (validated like a log path) or as a bare command name resolved through
+# PATH. Program paths are paths, so they get the PATH_MAX bound rather than
+# the identifier bound; without this, a deployment under a long prefix cannot
+# start at all.
+validate_exec_path() {
+    VALIDATE_REASON=''
+    if [ "$#" -ne 1 ]; then
+        _validate_fail 'expected exactly one argument'
+        return
+    fi
+    if [ "${#1}" -lt 1 ]; then
+        _validate_fail 'empty value'
+        return
+    fi
+    case $1 in
+        */*)
+            validate_log_path "$1"
+            return $?
+            ;;
+    esac
+    if [ "${#1}" -gt "$_VALIDATE_MAXLEN" ]; then
+        _validate_fail "longer than $_VALIDATE_MAXLEN characters"
+        return
+    fi
+    case $1 in
+        [!A-Za-z0-9]*)
+            _validate_fail 'must start with a letter or digit'
+            return
+            ;;
+        *[!A-Za-z0-9._-]*)
+            _validate_fail 'contains a character outside A-Z a-z 0-9 _ . -'
+            return
+            ;;
+    esac
+    return 0
+}
+
 validate_reason() {
     if [ -n "$VALIDATE_REASON" ]; then
         printf '%s\n' "$VALIDATE_REASON"
