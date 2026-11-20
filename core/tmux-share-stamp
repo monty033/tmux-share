@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+"""tmux-share-stamp: insert a timestamp where output resumes after a pause.
+
+Meant to sit behind `tmux pipe-pane`. It reads raw bytes from stdin and writes
+the very same bytes to stdout. The only addition is a stamp,
+
+    \\r\\n[YYYY-MM-DD HH:MM:SS] 
+
+placed in front of the first chunk of the stream and in front of any chunk that
+arrives more than GAP seconds after the previous write completed. Deleting
+exactly the inserted stamps gives back the input byte for byte.
+
+Properties:
+  * Nothing is buffered, split, decoded or rewritten. Each chunk is written (and
+    flushed) as soon as it is read, so partial UTF-8 and escape sequences cut
+    at a chunk boundary pass through untouched.
+  * Stamps mark the start of a resumed burst, not lines or seconds.
+  * The activity clock is read again only after the write has completed. A
+    write that blocks for a long time therefore counts as activity, and the
+    chunk that follows it is not mistaken for a resumed burst.
+
+Environment:
+  TMUX_SHARE_STAMP_GAP  idle threshold in seconds (float, default 1.0)
+
+Exit status: 0 at EOF, 1 on a read or write error (message on stderr).
+"""
+
+import math
+import os
+import sys
+import time
+
+DEFAULT_GAP = 1.0
+READ_SIZE = 65536
+STAMP_FORMAT = "\r\n[%Y-%m-%d %H:%M:%S] "
+
+
+def gap_from_environ(environ=None):
+    """Return the idle threshold in seconds, falling back to the default."""
+    environ = os.environ if environ is None else environ
+    raw = environ.get("TMUX_SHARE_STAMP_GAP")
+    if raw is None or not raw.strip():
+        return DEFAULT_GAP
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_GAP
+    if math.isnan(value) or value < 0:
+        return DEFAULT_GAP
+    return value
+
+
+GAP = gap_from_environ()
+
+
+def make_stamp(wall_time):
+    """Return the stamp for a wall-clock time (seconds since the epoch)."""
+    return time.strftime(STAMP_FORMAT, time.localtime(wall_time)).encode("ascii")
+
+
+def write_all(fd, data):
+    """Write every byte of data to fd, then return. Handles short writes."""
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        view = view[written:]
+
+
+def stamp_stream(read, write, clock=time.monotonic, wall=time.time, gap=None):
+    """Copy chunks from read() to write(), stamping resumed bursts.
+
+    read()   returns the next chunk of bytes, or b"" at EOF.
+    write(b) writes b completely (and flushes) before returning.
+    clock()  monotonic seconds, used only for idle detection.
+    wall()   epoch seconds, used only for the text of the stamp.
+
+    Returns 0 at EOF and 1 if read or write raises OSError.
+    """
+    gap = GAP if gap is None else gap
+    last_done = None  # clock() after the most recent completed write
+    while True:
+        try:
+            chunk = read()
+        except OSError as exc:
+            sys.stderr.write("tmux-share-stamp: read error: %s\n" % exc)
+            return 1
+        if not chunk:
+            return 0
+        now = clock()
+        if last_done is None or now - last_done > gap:
+            out = make_stamp(wall()) + chunk
+        else:
+            out = chunk
+        try:
+            write(out)
+        except OSError as exc:
+            sys.stderr.write("tmux-share-stamp: write error: %s\n" % exc)
+            return 1
+        # Only now, with the write finished, does the clock advance.
+        last_done = clock()
+
+
+def main():
+    # Raw descriptors: no text layer, no buffering, no dependence on sys.stdin.
+    stdin_fd = 0
+    stdout_fd = 1
+    return stamp_stream(
+        read=lambda: os.read(stdin_fd, READ_SIZE),
+        write=lambda data: write_all(stdout_fd, data),
+    )
+
+
+if __name__ == "__main__":
+    sys.exit(main())
