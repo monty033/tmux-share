@@ -1,0 +1,27 @@
+name: tmux-share
+label: "tmux-share transcript"
+kind: tool
+version: 0.1.0
+manifest_version: 2
+requires_hermes: ">=0.21.3"
+author: Bernie
+description: >
+  Reads a root-owned tmux transcript that the agent has no way to control.
+  Three read-only tools (tmux_share_status, tmux_share_tail, tmux_share_read)
+  report on and page through the transcript. They never write, truncate, or
+  send input, and they never start a process. The tools are hidden when the
+  transcript and socket are not deployed on this host.
+provides_tools:
+  - tmux_share_status
+  - tmux_share_tail
+  - tmux_share_read
+requires_env: []
+optional_env:
+  - name: TMUX_SHARE_LOG
+    description: "Path to the tmux-share transcript (default: /run/tmux-share/transcript.log)"
+    prompt: "tmux-share transcript path"
+    password: false
+  - name: TMUX_SHARE_SOCK
+    description: "Path to the tmux-share tmux socket, used only for the read-only self-check (default: /run/tmux-share/tmux.sock)"
+    prompt: "tmux-share socket path"
+    password: false
