@@ -371,14 +371,30 @@ check_eq "refuse: dummy file untouched" "$([ -f "$CASE_DIR/dummy.sock" ] && echo
 check_eq "refuse: tmux was never invoked" "$([ -e "$CASE_STATE/sockets" ] && echo invoked || echo never)" never
 check_eq "refuse: no scratch directory left" "$(find "$CASE_TMP" -mindepth 1 | wc -l | tr -d ' ')" 0
 
+# The deployment directory existing is normal: tmpfiles creates it at boot, so
+# refusing on the directory alone would make the probe useless on the host
+# that needs it. A writable existing directory must be allowed.
+new_case allow_writable_dir
+mkdir -p -- "$CASE_DIR/livedir"
+RC=0
+env TMPDIR="$CASE_TMP" TMUX_SHARE_DIR="$CASE_DIR/livedir" \
+    TMUX_SHARE_SOCK="$CASE_DIR/livedir/tmux.sock" \
+    TMUX_SHARE_TMUX="$FAKEWRAP" FAKE_TMUX_STATE="$CASE_STATE" \
+    "$SCRIPT" > "$CASE_DIR/out" 2> "$CASE_DIR/err" || RC=$?
+ERR=$(cat "$CASE_DIR/err")
+if [ "$RC" -ne 3 ]; then pass "allow: a writable existing deployment directory is not refused"; else fail "allow: a writable existing deployment directory is not refused (got 3)"; fi
+check_eq "allow: tmux was invoked" "$([ -e "$CASE_STATE/sockets" ] && echo invoked || echo never)" invoked
+
 new_case refuse_dir
 mkdir -p -- "$CASE_DIR/livedir"
+chmod 0500 -- "$CASE_DIR/livedir"
 RC=0
 env TMPDIR="$CASE_TMP" TMUX_SHARE_DIR="$CASE_DIR/livedir" \
     TMUX_SHARE_TMUX="$FAKEWRAP" FAKE_TMUX_STATE="$CASE_STATE" \
     "$SCRIPT" > "$CASE_DIR/out" 2> "$CASE_DIR/err" || RC=$?
+chmod 0700 -- "$CASE_DIR/livedir"
 ERR=$(cat "$CASE_DIR/err")
-check_eq "refuse: existing TMUX_SHARE_DIR exits 3" "$RC" 3
+check_eq "refuse: an unwritable TMUX_SHARE_DIR exits 3" "$RC" 3
 check_contains "refuse: message names TMUX_SHARE_DIR" "$ERR" 'TMUX_SHARE_DIR'
 check_eq "refuse: tmux was never invoked (dir case)" "$([ -e "$CASE_STATE/sockets" ] && echo invoked || echo never)" never
 

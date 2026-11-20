@@ -94,8 +94,12 @@ fi
 if [ -e "$REAL_SOCK" ] || [ -L "$REAL_SOCK" ]; then
     die "REFUSING TO RUN: TMUX_SHARE_SOCK ($REAL_SOCK) already exists; it may belong to a live deployment and the preflight never touches the real server" 3
 fi
-if [ -e "$REAL_DIR" ] || [ -L "$REAL_DIR" ]; then
-    die "REFUSING TO RUN: TMUX_SHARE_DIR ($REAL_DIR) already exists; it may belong to a live deployment and the preflight never touches the real server" 3
+# The deployment directory existing is normal, not evidence of a live
+# deployment: tmpfiles creates it at boot, so refusing on the directory alone
+# would make this probe unusable on exactly the host that needs it. The
+# socket is the thing that would mean a server is running.
+if [ -d "$REAL_DIR" ]; then
+    [ -w "$REAL_DIR" ] || die "REFUSING TO RUN: TMUX_SHARE_DIR ($REAL_DIR) exists and is not writable by this user, so the preflight cannot tell it apart from a live deployment" 3
 fi
 
 # ---- 3. scratch space and the EXIT trap -------------------------------------
