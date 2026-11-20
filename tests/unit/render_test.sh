@@ -87,6 +87,17 @@ for pair in 'TMUX_SHARE_SOCK=/tmp/a;b' 'TMUX_SHARE_LOG=relative' 'TMUX_SHARE_DIR
   done
 done
 
+# A program path is a path: an install prefix well past 64 characters must be
+# accepted, because that bound is for identifiers and this was the bug that
+# stopped a real installer.
+LONGP="$PWD/$(printf 'p%.0s' $(seq 1 80))"
+mkdir -p "$LONGP"; printf '#!/bin/sh\n' > "$LONGP/tmux"; chmod 0755 "$LONGP/tmux"
+rc=0
+env TMUX_SHARE_TMUX="$LONGP/tmux" "$render" tmux-config > "$out" 2> "$err" || rc=$?
+if [ "$rc" -eq 0 ] && [ -s "$out" ]; then pass 'accepts a program path longer than 64 characters'
+else fail "accepts a program path longer than 64 characters (rc=$rc)"; fi
+rm -rf "$LONGP"
+
 # The offending value itself is never echoed.
 TMUX_SHARE_SESSION='evil;value' run paths
 if ! grep -q 'evil' "$err"; then pass 'error message does not echo the rejected value'; else fail 'error message does not echo the rejected value'; fi

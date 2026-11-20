@@ -126,7 +126,11 @@ check_path() {
 }
 
 check_command() {
-    if ! validate_token "${!1}"; then
+    # A program is a path when it has a slash: validate_exec_path applies the
+    # PATH_MAX rules to it and the identifier rules to a bare command name.
+    # validate_token here was wrong and rejected any install prefix longer
+    # than 64 characters, which made the renderer refuse a normal deployment.
+    if ! validate_exec_path "${!1}"; then
         die "$1 rejected: $VALIDATE_REASON"
     fi
     # '%' is a pane-id character for validate_token but a specifier inside a
