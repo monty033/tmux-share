@@ -1,0 +1,222 @@
+#!/usr/bin/env bash
+# tmux-share-watchdog: one short-lived pass that keeps the transcript tap
+# attached to every pane of the shared session. A timer starts it about every
+# 20 seconds; it is not a daemon.
+#
+# One pass:
+#   1. validate the session name, log path and stamp path (before tmux);
+#   2. take the shared lock (busy lock: fail, the next pass retries);
+#   3. list the panes; classify a failure as "server not ready" (bounded
+#      grace) or as anything else (fails at once);
+#   4. attach `exec STAMP >> LOG` to every pane whose pipe is 0;
+#   5. exit non-zero if any attach or retire failed.
+#
+# REBUILD. A pipe that outlives a deleted transcript writes to an unlinked
+# inode; recreating the file recovers nothing. So a missing log records the
+# rebuild marker, and while the marker exists every pane is retired and
+# re-attached. The marker is removed only after every pane re-attached; any
+# failure leaves it for the next pass.
+#
+# NEVER `pipe-pane -o`: on tmux 3.7b it toggles, so a second call detaches the
+# tap and recording silently stops. Plain `pipe-pane -t PANE CMD` is used.
+#
+# Exit status: 0 = every pane that needed a tap has one and nothing failed
+#              1 = a pass step failed or the not-ready grace has expired
+#              2 = invalid configuration (nothing was touched)
+#             75 = lock busy (the next pass retries)
+set -eu
+
+HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+# ---- shared contract (all overridable by environment) ----------------------
+DIR=${TMUX_SHARE_DIR:-/run/tmux-share}
+SESSION=${TMUX_SHARE_SESSION:-tmux-hermes}
+SOCK=${TMUX_SHARE_SOCK:-$DIR/tmux.sock}
+LOG=${TMUX_SHARE_LOG:-$DIR/transcript.log}
+LOCK=${TMUX_SHARE_LOCK:-/run/tmux-share.lock}
+TMUX_SHARE_NOTREADY_MARKER=${TMUX_SHARE_NOTREADY_MARKER:-$DIR/.notready-since}
+REBUILD=${TMUX_SHARE_REBUILD:-$DIR/.rebuild-required}
+STAMP=${TMUX_SHARE_STAMP:-$HERE/../tmux-share-stamp}
+TMUX=${TMUX_SHARE_TMUX:-tmux}
+TIMEOUT=${TMUX_SHARE_TIMEOUT:-timeout}
+LIBDIR=${TMUX_SHARE_LIBDIR:-$HERE/../lib}
+export TMUX_SHARE_NOTREADY_MARKER
+
+# Seconds to wait for the lock. The contract value is 20; the variable exists
+# so a test does not have to sit through it.
+LOCK_WAIT=${TMUX_SHARE_LOCK_WAIT:-20}
+# Upper bound for every tmux call, so a wedged server cannot hold the lock.
+TMUX_BOUND=5
+
+# shellcheck source=../lib/validate.sh
+. "$LIBDIR/validate.sh"
+# shellcheck source=../lib/notready.sh
+. "$LIBDIR/notready.sh"
+
+log() { printf 'tmux-share-watchdog: %s\n' "$*" >&2; }
+die() { log "$*"; exit "${2:-1}"; }
+
+# ---- 1. validate before touching tmux --------------------------------------
+if ! validate_session_name "$SESSION"; then
+    die "invalid session name: $(validate_reason)" 2
+fi
+if ! validate_log_path "$LOG"; then
+    die "invalid log path: $(validate_reason)" 2
+fi
+# The stamp path is embedded in the command string as well.
+if ! validate_log_path "$STAMP"; then
+    die "invalid stamp path: $(validate_reason)" 2
+fi
+case $LOCK_WAIT in
+    '' | *[!0-9]*) die "invalid TMUX_SHARE_LOCK_WAIT" 2 ;;
+esac
+
+# ---- scratch space for tmux's stderr ---------------------------------------
+SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/tmux-share-watchdog.XXXXXX") \
+    || die "cannot create a scratch directory"
+trap 'rm -rf -- "$SCRATCH"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# ---- 2. shared lock ---------------------------------------------------------
+old_umask=$(umask)
+umask 077
+if ! { exec 9>>"$LOCK"; } 2>/dev/null; then
+    umask "$old_umask"
+    die "cannot open lock file $LOCK"
+fi
+umask "$old_umask"
+if ! flock -w "$LOCK_WAIT" -x 9; then
+    die "lock $LOCK is busy after ${LOCK_WAIT}s; the next pass will retry" 75
+fi
+
+# ---- helpers ----------------------------------------------------------------
+failures=0
+fail() { log "$*"; failures=$((failures + 1)); }
+
+# tmux ARGS...: bounded, with the lock descriptor closed in the child.
+tmux_bounded() {
+    "$TIMEOUT" "$TMUX_BOUND" "$TMUX" -S "$SOCK" "$@" 9>&-
+}
+
+# is_not_ready RC STDERR_FILE: 0 only when the failure is the server being
+# absent. Every non-empty stderr line must be a known "absent" message; one
+# unrecognised line (a permission refusal, say) makes the whole failure real.
+# A timeout (124) or a kill (>=128) is a wedge, never "not ready".
+is_not_ready() {
+    local rc=$1 errfile=$2 line seen=0
+    [ "$rc" -ne 0 ] || return 1
+    [ "$rc" -lt 124 ] || return 1
+    while IFS= read -r line || [ -n "$line" ]; do
+        [ -n "$line" ] || continue
+        case $line in
+            *'no server running'*) ;;
+            *"can't find session"*) ;;
+            *'error connecting to'*'(No such file or directory)'*) ;;
+            *) return 1 ;;
+        esac
+        seen=1
+    done < "$errfile"
+    [ "$seen" -eq 1 ]
+}
+
+# not_ready_message: how long the server has been not ready, from the marker
+# that notready_check keeps.
+not_ready_message() {
+    local now='' start=''
+    if now=$(_notready_now) && start=$(_notready_read "$TMUX_SHARE_NOTREADY_MARKER"); then
+        printf 'tmux server has been not ready for %ss (since uptime %ss, grace %ss)' \
+            "$((now - start))" "$start" "${TMUX_SHARE_NOTREADY_GRACE:-300}"
+    else
+        printf 'tmux server has been not ready past the grace window (duration unknown)'
+    fi
+}
+
+# ---- 3. enumerate panes -----------------------------------------------------
+rebuild=0
+if [ ! -e "$LOG" ]; then
+    # The pipe, if any, is writing to an unlinked inode: the tap is stale.
+    log "log $LOG is missing; recording the rebuild marker"
+    if ! ( umask 077; : > "$REBUILD" ) 2>/dev/null; then
+        fail "cannot write rebuild marker $REBUILD"
+    fi
+    rebuild=1
+elif [ -e "$REBUILD" ]; then
+    log "rebuild marker present from an earlier pass; rebuilding the tap"
+    rebuild=1
+fi
+
+errfile=$SCRATCH/list.err
+rc=0
+panes=$(tmux_bounded list-panes -s -t "$SESSION" -F '#{pane_id} #{pane_pipe}' 2> "$errfile") || rc=$?
+
+if [ "$rc" -ne 0 ]; then
+    if is_not_ready "$rc" "$errfile"; then
+        if notready_check; then
+            log "tmux server not ready yet (excused by the grace window)"
+            exit 0
+        fi
+        die "$(not_ready_message)"
+    fi
+    detail=$(head -c 300 "$errfile" | tr '\n' ' ')
+    if [ "$rc" -eq 124 ]; then
+        die "tmux did not answer within ${TMUX_BOUND}s (wedged?): ${detail:-no output}"
+    fi
+    die "tmux list-panes failed (rc=$rc), not a not-ready condition: ${detail:-no output}"
+fi
+
+# A successful enumeration: the server is up.
+if ! server_ready; then
+    fail "cannot clear the not-ready marker $TMUX_SHARE_NOTREADY_MARKER"
+fi
+
+# ---- 4. attach / rebuild per pane ------------------------------------------
+cmd="exec $STAMP >> $LOG"
+attached=0
+
+while IFS=' ' read -r pane pipe _; do
+    [ -n "$pane" ] || continue
+    if ! validate_token "$pane"; then
+        fail "skipping pane with invalid id: $(validate_reason)"
+        continue
+    fi
+    case $pipe in
+        0 | 1) ;;
+        *)
+            fail "pane $pane reported an unexpected pipe state"
+            continue
+            ;;
+    esac
+
+    if [ "$rebuild" -eq 0 ] && [ "$pipe" = 1 ]; then
+        continue
+    fi
+
+    if [ "$pipe" = 1 ]; then
+        # Retire the stale tap: pipe-pane with no command closes the pipe.
+        if ! tmux_bounded pipe-pane -t "$pane" 2> "$errfile"; then
+            fail "retire failed for pane $pane: $(head -c 200 "$errfile" | tr '\n' ' ')"
+            continue
+        fi
+    fi
+
+    if tmux_bounded pipe-pane -t "$pane" "$cmd" 2> "$errfile"; then
+        attached=$((attached + 1))
+        log "attached tap to pane $pane"
+    else
+        fail "attach failed for pane $pane: $(head -c 200 "$errfile" | tr '\n' ' ')"
+    fi
+done <<< "$panes"
+
+# ---- 5. settle the rebuild marker and report -------------------------------
+if [ "$rebuild" -eq 1 ] && [ "$failures" -eq 0 ]; then
+    if ! rm -f -- "$REBUILD" 2>/dev/null; then
+        fail "cannot remove rebuild marker $REBUILD"
+    fi
+fi
+
+if [ "$failures" -ne 0 ]; then
+    log "pass finished with $failures failure(s); rebuild marker kept if owed"
+    exit 1
+fi
+exit 0
