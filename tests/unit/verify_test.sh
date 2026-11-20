@@ -70,8 +70,12 @@ PY
 }
 
 # run the verifier against a tree built by build_good_tree
+# run_verify TREE [BINDIR] -- BINDIR defaults to the synthetic tree's bin, but
+# a case can point it at the repository's own scripts to check them.
 run_verify() {
-    local t=$1; shift
+    local t=$1 bindir=${2:-} 
+    shift || true
+    [ -n "$bindir" ] && shift || true
     env TMUX_SHARE_DIR="$t/deploy" \
         TMUX_SHARE_SOCK="$t/deploy/tmux.sock" \
         TMUX_SHARE_LOG="$t/deploy/transcript.log" \
@@ -79,7 +83,7 @@ run_verify() {
         TMUX_SHARE_STAMP="$t/stamp" \
         TMUX_SHARE_LIBDIR="$CORE/core/lib" \
         TMUX_SHARE_GROUP="$ME_GROUP" \
-        TMUX_SHARE_BINDIR="$t/bin" \
+        TMUX_SHARE_BINDIR="${bindir:-$t/bin}" \
         TMUX_SHARE_UNITDIR="$t/units" \
         TMUX_SHARE_VERIFY_OWNER="$ME_USER:$ME_GROUP" \
         bash "$VERIFY" "$@"
@@ -150,6 +154,22 @@ case $out in
     *no-unbounded-tmux-call*) ok 'the unbounded-call check is the one that failed' ;;
     *) bad 'the unbounded-call check is the one that failed' ;;
 esac
+
+# ---------------------------------------------------------------- case 5c
+# The static rules (the pipe-pane toggle and the unbounded tmux call) must be
+# checked against the scripts this repository ships, not only against synthetic
+# trees. Without this, bypassing tmux_bounded in core/bin passed every test.
+T5c=$TMP/ownscripts; build_good_tree "$T5c"
+make_socket "$T5c/deploy/tmux.sock" 600 >/dev/null 2>&1 || true
+rc=0; out=$(run_verify "$T5c" "$CORE/core/bin" 2>&1) || rc=$?
+# Only the two static checks matter here; the synthetic tree's ownership will
+# legitimately fail the root-owned ones, so the verdict is per check name.
+if printf '%s\n' "$out" | grep -qE '^FAIL no-(unbounded-tmux-call|pipe-pane-dash-o)'; then
+    bad 'the shipped scripts satisfy the static rules'
+    printf '%s\n' "$out" | grep -E '^FAIL no-(unbounded-tmux-call|pipe-pane-dash-o)' | head -2
+else
+    ok 'the shipped scripts satisfy the static rules'
+fi
 
 # ---------------------------------------------------------------- case 6
 T6=$TMP/badstamp; build_good_tree "$T6"

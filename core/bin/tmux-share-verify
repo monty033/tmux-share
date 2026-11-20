@@ -276,11 +276,15 @@ _PP_O_RE="(^|[[:space:]])${_PP}([[:space:]]+[^[:space:]]+)*[[:space:]]+-[IOot]*o
 check_begin no-pipe-pane-dash-o
 scanned=0
 hits=''
+# tmux-share-preflight is excluded: its whole job is to measure what `pipe-pane
+# -o` does on this tmux build, so the flag must appear there. Every other script
+# must never use it.
 for d in "$BINDIR" "$LIBDIR"; do
     [ -d "$d" ] || continue
     scanned=$((scanned + 1))
     found=$( { grep -rEnI -e "$_PP_O_RE" -- "$d" 2>/dev/null || true; } \
-        | { grep -Ev '^[^:]*:[0-9]+:[[:space:]]*#' || true; } )
+        | { grep -Ev '^[^:]*:[0-9]+:[[:space:]]*#' || true; } \
+        | { grep -Ev '/tmux-share-preflight:' || true; } )
     if [ -n "$found" ]; then
         hits=${hits:+$hits$'\n'}$found
     fi
@@ -310,7 +314,7 @@ _direct_tmux_hits() {
         /^[[:space:]]*#/ { next }
         { print FILENAME ":" FNR ":" $0 }
     ' "$dir"/* 2>/dev/null \
-        | grep -E '(^|[;&|(]|[[:space:]])\$?\{?"?\$?TMUX"?([[:space:]]|$)|(^|[;&|(]|[[:space:]])tmux([[:space:]]|$)' \
+        | grep -E '(^[[:space:]]*|[;&|(][[:space:]]*(exec[[:space:]]+)?)("\$TMUX"|\$\{?TMUX\}?|tmux)([[:space:]]|$)' \
         | grep -v 'tmux_bounded' || true
 }
 check_begin no-unbounded-tmux-call
