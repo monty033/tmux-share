@@ -49,3 +49,15 @@ Recording is not gap-free. Output produced before the tap attaches at startup, a
 - docs/install-nixos.md — module options, minimal configuration, verification.
 - docs/install-systemd.md — preflight, install, units, uninstall.
 - docs/operations.md — daily use, timers, diagnosis, changing the session.
+
+## Development
+
+Requires `just`. `just test` runs every suite and is the only command that has
+to be green before a change lands.
+
+```
+just test       # all suites
+just lint       # shell syntax, shellcheck if installed, python compile
+just selftest   # disposable end-to-end run against a scratch tmux server
+just verify     # inspect a live deployment, change nothing
+```
