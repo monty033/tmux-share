@@ -1,0 +1,29 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install just
+        uses: extractions/setup-just@v2
+
+      - name: Install the tools the suites use
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends tmux python3 util-linux
+          tmux -V
+          python3 --version
+
+      - name: Run every suite
+        run: just test
+
+      - name: Show the failure detail on a red run
+        if: failure()
+        run: |
+          just test || true

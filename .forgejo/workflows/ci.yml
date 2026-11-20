@@ -1,0 +1,29 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: docker
+    container:
+      image: node:22-bookworm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the tools the suites use
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends tmux python3 util-linux curl ca-certificates fish
+          tmux -V
+          python3 --version
+
+      - name: Install just
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh \
+            | bash -s -- --to /usr/local/bin --tag 1.51.0
+          just --version
+
+      - name: Run every suite
+        run: just test

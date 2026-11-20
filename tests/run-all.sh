@@ -61,9 +61,11 @@ $name"
     fi
 }
 
+# tests/mutation is deliberately not here: it runs seven suites to prove they
+# can fail, which belongs on its own (`just mutate`), not in every green run.
 for t in tests/unit/*.sh tests/systemd/*.sh tests/install/*.sh \
          tests/docs/*.sh tests/nix/*.sh tests/privacy/*.sh \
-         tests/stubs/*.sh; do
+         tests/parity/*.sh tests/stubs/*.sh; do
     [ -f "$t" ] || continue
     case "$t" in
         # fake-tmux is a test double, not a suite; its own test is *_test.sh.
