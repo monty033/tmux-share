@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# tmux-share-attach: the operator's command to attach to the monitored session.
+#
+# WHY THIS COMMAND EXISTS
+#   The tmux server socket is owned by root and is not group- or
+#   world-accessible, so attaching needs root and a fixed, validated command
+#   line. This wrapper is that command line. The reader account never gets
+#   this command and never gets access to the socket: it reads the
+#   transcript file and nothing else.
+#
+# USAGE
+#   tmux-share-attach [--check] [TMUX ATTACH OPTIONS...]
+#
+#   Runs, as root only:   $TMUX_SHARE_TMUX -S $SOCK attach -t $SESSION "$@"
+#   Operator arguments are appended after the session, so tmux options such
+#   as -r (read-only) or -d (detach other clients) pass straight through.
+#
+#   --check   (any position, consumed here, never passed to tmux)
+#             Print the exact argv that would be executed, on one line, and
+#             exit 0 without executing it. Works for any caller, root or not,
+#             so an operator can see what would run and tests can assert it
+#             without root. It does not weaken the root requirement: the only
+#             thing --check can do is print; it never reaches exec. The real
+#             path refuses a non-root caller before any validation or tmux
+#             call. There is deliberately no environment variable or flag
+#             that overrides the uid test.
+#
+# EXIT STATUS
+#   0  --check printed an argv (or tmux, via exec, replaced this process)
+#   1  caller is not root, or a configuration value failed validation
+#
+# ENVIRONMENT (shared contract, all overridable)
+#   TMUX_SHARE_DIR      default /run/tmux-share
+#   TMUX_SHARE_SESSION  default tmux-hermes   (validate_session_name)
+#   TMUX_SHARE_SOCK     default $TMUX_SHARE_DIR/tmux.sock (validate_log_path)
+#   TMUX_SHARE_TMUX     default tmux          (validate_exec_path: a path or a bare command)
+#   TMUX_SHARE_LIBDIR   default <this script's directory>/../lib
+set -eu
+
+prog=tmux-share-attach
+
+here=${BASH_SOURCE[0]%/*}
+[ "$here" != "${BASH_SOURCE[0]}" ] || here=.
+
+: "${TMUX_SHARE_DIR:=/run/tmux-share}"
+: "${TMUX_SHARE_SESSION:=tmux-hermes}"
+: "${TMUX_SHARE_SOCK:=$TMUX_SHARE_DIR/tmux.sock}"
+: "${TMUX_SHARE_TMUX:=tmux}"
+: "${TMUX_SHARE_LIBDIR:=$here/../lib}"
+
+die() {
+    printf '%s: %s\n' "$prog" "$1" >&2
+    exit 1
+}
+
+# Split our own flag from the operator's arguments, keeping their order.
+check=0
+args=()
+for a in "$@"; do
+    if [ "$a" = '--check' ]; then
+        check=1
+    else
+        args+=("$a")
+    fi
+done
+
+# Root gate for the real path. Checked before anything else so a non-root
+# caller causes no validation work and no tmux call.
+if [ "$check" -eq 0 ] && [ "$EUID" -ne 0 ]; then
+    die "this command is root-only (the tmux socket is root-owned); re-run as root"
+fi
+
+# shellcheck source=../lib/validate.sh
+. "$TMUX_SHARE_LIBDIR/validate.sh"
+
+if ! validate_session_name "$TMUX_SHARE_SESSION"; then
+    die "TMUX_SHARE_SESSION rejected: $VALIDATE_REASON"
+fi
+if ! validate_log_path "$TMUX_SHARE_SOCK"; then
+    die "TMUX_SHARE_SOCK rejected: $VALIDATE_REASON"
+fi
+if ! validate_exec_path "$TMUX_SHARE_TMUX"; then
+    die "TMUX_SHARE_TMUX rejected: $VALIDATE_REASON"
+fi
+case $TMUX_SHARE_TMUX in
+    -*) die "TMUX_SHARE_TMUX rejected: must not start with '-'" ;;
+esac
+
+argv=("$TMUX_SHARE_TMUX" -S "$TMUX_SHARE_SOCK" attach -t "$TMUX_SHARE_SESSION" ${args[@]+"${args[@]}"})
+
+if [ "$check" -eq 1 ]; then
+    # %q keeps operator arguments with spaces unambiguous on the one line.
+    out=''
+    for a in "${argv[@]}"; do
+        out+="${out:+ }$(printf '%q' "$a")"
+    done
+    printf '%s\n' "$out"
+    exit 0
+fi
+
+exec "${argv[@]}"
