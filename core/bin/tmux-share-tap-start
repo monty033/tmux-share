@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+# tmux-share-tap-start: attach the transcript tap to every pane of the
+# session, once, at server start.
+#
+# Steps:
+#   1. validate the session name, log path, lock path, socket path and stamp
+#      path (nothing reaches tmux or a command string before this passes);
+#   2. wait for the session to appear (about 100 x 0.1 s);
+#   3. take the lock shared with the watchdog and the trimmer;
+#   4. create the log if missing (0640), list the panes;
+#   5. attach the tap to each pane whose pipe is not yet active.
+#
+# Idempotent: a pane with an active pipe is left alone, so a second run does
+# no work. pipe-pane is NEVER called with -o: on tmux 3.7b -o toggles, so a
+# repeated call silently detaches the tap and recording stops.
+#
+# Exit status: 0 every pane without a pipe got one (or none needed one);
+#              1 failure (session never appeared, lock busy, tmux error, a
+#                pane could not be attached, invalid input).
+set -eu
+
+# ---- shared contract (see CORE-CONTRACT.md) --------------------------------
+HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+CORE_DIR=$(CDPATH= cd -- "$HERE/.." && pwd)
+
+TMUX_SHARE_DIR=${TMUX_SHARE_DIR:-/run/tmux-share}
+TMUX_SHARE_SESSION=${TMUX_SHARE_SESSION:-tmux-hermes}
+TMUX_SHARE_SOCK=${TMUX_SHARE_SOCK:-$TMUX_SHARE_DIR/tmux.sock}
+TMUX_SHARE_LOG=${TMUX_SHARE_LOG:-$TMUX_SHARE_DIR/transcript.log}
+TMUX_SHARE_LOCK=${TMUX_SHARE_LOCK:-/run/tmux-share.lock}
+TMUX_SHARE_STAMP=${TMUX_SHARE_STAMP:-$CORE_DIR/tmux-share-stamp}
+TMUX_SHARE_TMUX=${TMUX_SHARE_TMUX:-tmux}
+TMUX_SHARE_TIMEOUT=${TMUX_SHARE_TIMEOUT:-timeout}
+TMUX_SHARE_LIBDIR=${TMUX_SHARE_LIBDIR:-$HERE/../lib}
+
+SESSION=$TMUX_SHARE_SESSION
+SOCK=$TMUX_SHARE_SOCK
+LOG=$TMUX_SHARE_LOG
+LOCK=$TMUX_SHARE_LOCK
+STAMP=$TMUX_SHARE_STAMP
+TMUX=$TMUX_SHARE_TMUX
+TIMEOUT=$TMUX_SHARE_TIMEOUT
+
+WAIT_TRIES=100        # has-session attempts
+WAIT_STEP=0.1         # seconds between attempts
+HAS_SESSION_SECS=5    # bound for one has-session call
+TMUX_SECS=10          # bound for list-panes and each pipe-pane
+LOCK_WAIT_SECS=20
+
+# shellcheck source=../lib/validate.sh
+. "$TMUX_SHARE_LIBDIR/validate.sh"
+
+log() { printf 'tmux-share-tap-start: %s\n' "$*"; }
+die() { printf 'tmux-share-tap-start: %s\n' "$*" >&2; exit 1; }
+
+# ---- validate before anything is used --------------------------------------
+if ! validate_session_name "$SESSION"; then
+    die "invalid session name: $(validate_reason)"
+fi
+if ! validate_log_path "$LOG"; then
+    die "invalid log path: $(validate_reason)"
+fi
+if ! validate_log_path "$LOCK"; then
+    die "invalid lock path: $(validate_reason)"
+fi
+if ! validate_log_path "$SOCK"; then
+    die "invalid socket path: $(validate_reason)"
+fi
+# The stamp program is embedded in the pipe-pane command string.
+if ! validate_exec_path "$STAMP"; then
+    die "invalid stamp program path: $(validate_reason)"
+fi
+if [ ! -x "$STAMP" ]; then
+    die "stamp program is not executable: $STAMP"
+fi
+
+# ---- wait for the session --------------------------------------------------
+tries=0
+while ! "$TIMEOUT" "$HAS_SESSION_SECS" "$TMUX" -S "$SOCK" has-session -t "$SESSION" \
+        </dev/null >/dev/null 2>&1; do
+    tries=$((tries + 1))
+    if [ "$tries" -ge "$WAIT_TRIES" ]; then
+        die "session '$SESSION' did not appear after $tries attempts"
+    fi
+    sleep "$WAIT_STEP"
+done
+
+# ---- serialise against the watchdog and the trimmer -------------------------
+if [ ! -e "$LOCK" ]; then
+    ( umask 077; : >> "$LOCK" ) || die "cannot create lock $LOCK"
+fi
+exec 9>>"$LOCK" || die "cannot open lock $LOCK"
+if ! flock -w "$LOCK_WAIT_SECS" -x 9; then
+    die "lock $LOCK is busy after ${LOCK_WAIT_SECS}s; the tap was not attached, the watchdog will retry"
+fi
+
+# ---- the log ----------------------------------------------------------------
+if [ ! -e "$LOG" ]; then
+    ( umask 027; : >> "$LOG" ) || die "cannot create log $LOG"
+fi
+
+# ---- enumerate panes --------------------------------------------------------
+if panes=$("$TIMEOUT" "$TMUX_SECS" "$TMUX" -S "$SOCK" list-panes -s -t "$SESSION" \
+        -F '#{pane_id} #{pane_pipe}' </dev/null 9>&-); then
+    :
+else
+    rc=$?
+    die "list-panes failed or timed out for session '$SESSION' (rc=$rc)"
+fi
+if [ -z "$panes" ]; then
+    die "session '$SESSION' reports no panes"
+fi
+
+# ---- attach where no pipe is active -----------------------------------------
+attached=0
+already=0
+failed=0
+while read -r pane pipe; do
+    if ! validate_token "$pane"; then
+        printf 'tmux-share-tap-start: refusing pane id %q: %s\n' "$pane" "$(validate_reason)" >&2
+        failed=$((failed + 1))
+        continue
+    fi
+    case $pipe in
+        1)
+            already=$((already + 1))
+            continue
+            ;;
+        0) ;;
+        *)
+            printf 'tmux-share-tap-start: pane %s: unexpected pane_pipe value %q\n' "$pane" "$pipe" >&2
+            failed=$((failed + 1))
+            continue
+            ;;
+    esac
+    # No -o: it toggles on tmux 3.7b. pane_pipe was 0, so a plain call attaches.
+    if "$TIMEOUT" "$TMUX_SECS" "$TMUX" -S "$SOCK" pipe-pane -t "$pane" \
+            "exec $STAMP >> $LOG" </dev/null 9>&-; then
+        attached=$((attached + 1))
+    else
+        printf 'tmux-share-tap-start: pane %s: pipe-pane failed\n' "$pane" >&2
+        failed=$((failed + 1))
+    fi
+done <<EOF
+$panes
+EOF
+
+if [ "$failed" -gt 0 ]; then
+    die "$failed pane(s) not attached ($attached attached, $already already tapped)"
+fi
+if [ "$attached" -eq 0 ]; then
+    log "nothing to do: all $already pane(s) of '$SESSION' already tapped"
+else
+    log "attached the tap to $attached pane(s) of '$SESSION' ($already already tapped)"
+fi
+exit 0
