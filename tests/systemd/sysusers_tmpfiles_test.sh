@@ -191,11 +191,26 @@ run 'sysusers: declares only the group tmux-share' assert_sysusers_group_only "$
 run 'sysusers: no user (u) or membership (m) line' assert_no_user_line "$sysusers"
 run 'sysusers: header documents the usermod command' assert_documents_usermod "$sysusers"
 
+# The distro tools are checked against the deployed files, so their verdict must
+# not depend on this machine's state: a group that exists only after installation,
+# a newer or older option set, or a read-only /run all produce a refusal that says
+# nothing about the file being wrong. Those are reported as skips with the tool's
+# own words; anything else is a real failure. This check failed on Ubuntu purely
+# because the wording of a refusal differed.
+first_line() {
+    printf '%s\n' "$1" | head -1
+}
+env_caused() {
+    printf '%s\n' "$1" | grep -qiE 'unrecognized option|unknown option|unknown (user|group)|cannot resolve|not supported|permission denied|read-only file system|no such file or directory'
+}
+
 # --- systemd's own parsers, when available ------------------------------------
 # Absolute paths throughout: the files are passed exactly as located above.
 if command -v systemd-sysusers >/dev/null 2>&1; then
     if out=$(systemd-sysusers --dry-run "$sysusers" 2>&1); then
         ok 'systemd-sysusers --dry-run accepts the file'
+    elif env_caused "$out"; then
+        skp 'systemd-sysusers --dry-run' "environment: $(first_line "$out")"
     else
         bad 'systemd-sysusers --dry-run accepts the file' "$out"
     fi
@@ -206,6 +221,8 @@ fi
 if command -v systemd-tmpfiles >/dev/null 2>&1; then
     if out=$(systemd-tmpfiles --dry-run --create "$tmpfiles" 2>&1); then
         ok 'systemd-tmpfiles --dry-run --create accepts the file'
+    elif env_caused "$out"; then
+        skp 'systemd-tmpfiles --dry-run --create' "environment: $(first_line "$out")"
     else
         bad 'systemd-tmpfiles --dry-run --create accepts the file' "$out"
     fi

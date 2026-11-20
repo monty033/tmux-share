@@ -1,6 +1,7 @@
 name: ci
 
 on:
+  workflow_dispatch:
   push:
   pull_request:
 
@@ -9,11 +10,15 @@ jobs:
     runs-on: nixos
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      # Two things are deliberately avoided here, both learned from failed runs:
+      # 1. `uses:` -- this instance resolves actions from github.com
+      #    (DEFAULT_ACTIONS_URL = "github") and the runner cannot fetch them, so
+      #    any action step fails the job in under two seconds.
+      # 2. `just` and the real `tmux` binary -- neither is on the host runner's
+      #    PATH. The suites use the fake tmux in tests/stubs and skip the one
+      #    check that wants a real one, so run-all.sh is the right entry point.
       - run: |
           set -euo pipefail
-          export PATH="/run/current-system/sw/bin:$PATH"
-          tmux -V
-          python3 --version
-          just --version
-          just test
+          git clone --depth 1 "https://git.montycasa.net/${GITHUB_REPOSITORY:-patrick/tmux-share}.git" src
+          cd src
+          bash tests/run-all.sh

@@ -230,13 +230,38 @@ if command -v systemd-analyze >/dev/null 2>&1; then
     for u in $ALL_UNITS; do cp -- "$units_dir/$u" "$vdir/$u"; done
     vrc=0
     vout=$(cd "$vdir" && systemd-analyze verify $(for u in $ALL_UNITS; do printf './%s ' "$u"; done) 2>&1) || vrc=$?
-    other=$(printf '%s\n' "$vout" | grep -v '^$' | grep -v 'is not executable: No such file or directory' || true)
+    # Decide from the filesystem, not from the wording. Distro systemd versions
+    # phrase the same complaint differently, and matching their text made this
+    # check pass on NixOS and fail on Ubuntu. A complaint that names a path which
+    # does not exist on this host is the expected "not installed here" case; a
+    # complaint that names no path, or a path that does exist, is a real problem.
+    deployment_paths=$(grep -hoE '^(ExecStart|ExecStartPost)=-?[^ ]+' "$units_dir"/*.service 2>/dev/null \
+        | sed -e 's/^[^=]*=//' -e 's/^-//' | sort -u || true)
+    real=''
+    if [ -n "$vout" ]; then
+        while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            named=$(printf '%s' "$line" | grep -oE '/[^ ：:,]+' | head -1 || true)
+            if [ -n "$named" ] && [ ! -e "$named" ]; then
+                continue    # the unit points at something not installed here
+            fi
+            real=${real:+$real;}$line
+        done <<EOF
+$vout
+EOF
+    fi
+    # A deployment path the test itself extracted must be absent for the skip to
+    # hold, otherwise the path came from somewhere unexpected.
     if [ "$vrc" -eq 0 ] && [ -z "$vout" ]; then
         pass 'systemd-analyze verify: clean'
-    elif [ -z "$other" ]; then
-        skip "systemd-analyze verify: only missing deployment binaries (not installed on this host): $(printf '%s' "$vout" | tr '\n' ';')"
+    elif [ -z "$real" ] && [ -n "$deployment_paths" ]; then
+        missing=''
+        for p in $deployment_paths; do
+            [ -e "$p" ] || missing="$missing $p"
+        done
+        skip "systemd-analyze verify: only complaints about binaries not installed on this host:$missing"
     else
-        fail "systemd-analyze verify (rc=$vrc): $(printf '%s' "$vout" | tr '\n' ';')"
+        fail "systemd-analyze verify (rc=$vrc): ${real:-$(printf '%s' "$vout" | tr '\n' ';')}"
     fi
 else
     skip 'systemd-analyze verify: systemd-analyze is not installed'
