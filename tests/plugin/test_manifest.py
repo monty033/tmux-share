@@ -83,7 +83,7 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(scalar(TEXT, "kind"), "tool")
         self.assertEqual(scalar(TEXT, "version"), "0.1.0")
         self.assertEqual(scalar(TEXT, "manifest_version"), "2")
-        self.assertEqual(scalar(TEXT, "author"), "Bernie")
+        self.assertEqual(scalar(TEXT, "author"), "Patrick")
 
     def test_requires_hermes_is_present_and_pinned(self):
         self.assertEqual(scalar(TEXT, "requires_hermes"), ">=0.21.3")
