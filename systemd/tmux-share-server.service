@@ -1,0 +1,28 @@
+# tmux-share-server.service: the dedicated tmux server. Plain-systemd install
+# path (/etc/systemd/system); mirrors what the NixOS module declares.
+
+[Unit]
+# Description: shown by systemctl status and in the journal.
+Description=tmux-share dedicated tmux server
+# After: the socket directory is created by tmpfiles (mode 0710), so order after it.
+After=local-fs.target systemd-tmpfiles-setup.service
+
+[Service]
+# Type=simple: the tmux server (-D, foreground) is the unit's main process.
+Type=simple
+# EnvironmentFile: contract variables for tap-start; the leading - lets the server start without it.
+EnvironmentFile=-/etc/tmux-share/env
+# ExecStart: -D keeps tmux in the foreground; the socket and config paths are the contract defaults.
+ExecStart=/usr/bin/tmux -D -S /run/tmux-share/tmux.sock -f /etc/tmux-share/tmux.conf
+# ExecStartPost: the leading - is deliberate; a failed tap must not tear down the operator's live session.
+ExecStartPost=-/usr/local/bin/tmux-share-tap-start
+# Restart: come back after a crash; a clean exit (exit-empty, last session gone) stays stopped.
+Restart=on-failure
+# RestartSec: do not spin if the server dies at once.
+RestartSec=2
+# NOT declared, on purpose: RuntimeDirectory (tmpfiles owns /run/tmux-share at 0710; the unit would recreate it 0755).
+# NOT declared, on purpose: UMask (the server's umask becomes the operator shell's umask).
+
+[Install]
+# WantedBy: start the server at boot.
+WantedBy=multi-user.target
