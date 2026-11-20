@@ -1,0 +1,458 @@
+#!/usr/bin/env bash
+# tmux-share-verify: read-only static verifier for a tmux-share deployment.
+#
+# An operator runs it after install; CI runs it against a live-ish tree. It
+# never starts, stops or modifies anything: it stats files, reads unit files,
+# greps scripts, runs the stamp filter on one line of its own input and tries
+# one unix connect (closed at once, nothing sent). Its only scratch space is
+# a mktemp directory, removed on exit.
+#
+# CHECKS (reported through core/lib/checks.sh, in this order)
+#   1. deploy-dir-traversable-not-listable
+#        directory exists, mode 0710 or 0750, owned root:<group>
+#   2. transcript-mode-owner
+#        transcript exists, mode 0640, owned root:<group>
+#   3. socket-owner-only
+#        socket exists, mode 0600 or 0700, owned root:root
+#   4. lock-mode-owner
+#        lock file, if present, mode 0600, owned root:root
+#   5. reader-cannot-connect-socket
+#        a unix connect from the CURRENT user must fail with EACCES/EPERM.
+#        See "CHECK 5" below.
+#   6. no-pipe-pane-dash-o
+#        no executable (non-comment) line in the deployment's scripts calls
+#        pipe-pane with -o: a second -o detaches the tap
+#   7. unit-tap-oneshot, unit-trim-oneshot,
+#      unit-server-not-no-block-only, unit-server-no-umask-0077
+#        properties of the units under the system unit directory. A unit
+#        that is not installed is skipped. "Not --no-block-only" means: the
+#        server unit's ExecStart= lines must not all go through --no-block
+#        (a unit that only hands off with --no-block reports "started"
+#        before the server is up). Drop-ins (<unit>.d/*.conf) are read too.
+#   8. stamp-filter-stamps-and-preserves-bytes
+#        the stamp filter is executable and, given one line (with non-UTF-8
+#        and escape bytes), emits a stamp followed by exactly those bytes
+#   9. reader-in-transcript-group
+#        the reader account, if it exists, has the transcript group
+#
+# Every check is skipped, with the missing thing named, when its target is
+# absent, so the verifier is usable on an uninstalled tree.
+#
+# CHECK 5, for each kind of caller
+#   root          SKIP. Root can connect to any socket whatever its mode, so
+#                 a pass would be false. Re-run as the reader account.
+#   non-root      attempts connect(2) and reads the errno:
+#                   EACCES / EPERM          PASS (the kernel refused us)
+#                   connected / ECONNREFUSED  the kernel PERMITTED access
+#                       (refused only means nobody listens). FAIL, except
+#                       when the caller owns the socket: an owner is
+#                       permitted by design and the result says nothing
+#                       about the reader, so SKIP with that reason.
+#                   anything else           FAIL, inconclusive
+#                 The probe tests the account that runs the verifier. For a
+#                 verdict about the reader account, run it as that account.
+#
+# EXIT STATUS
+#   0  no check failed (skips never fail the run)
+#   1  at least one check failed
+#   2  invalid configuration or usage (nothing was checked)
+#
+# ENVIRONMENT (shared contract, all overridable)
+#   TMUX_SHARE_DIR=/run/tmux-share
+#   TMUX_SHARE_SOCK=$DIR/tmux.sock
+#   TMUX_SHARE_LOG=$DIR/transcript.log
+#   TMUX_SHARE_LOCK=/run/tmux-share.lock
+#   TMUX_SHARE_STAMP=<core/tmux-share-stamp>
+#   TMUX_SHARE_TIMEOUT=timeout
+#   TMUX_SHARE_LIBDIR=<core/lib>
+# Specific to the verifier:
+#   TMUX_SHARE_GROUP=tmux-share        transcript group
+#   TMUX_SHARE_READER=                 reader account (unset: check 9 skips)
+#   TMUX_SHARE_BINDIR=<this directory> installed script directory (check 6;
+#                                      the lib directory is scanned too)
+#   TMUX_SHARE_UNITDIR=/etc/systemd/system
+#   TMUX_SHARE_UNIT_TAP=tmux-share-tap.service
+#   TMUX_SHARE_UNIT_TRIM=tmux-share-trim.service
+#   TMUX_SHARE_UNIT_SERVER=tmux-share-server.service
+#   TMUX_SHARE_VERIFY_OWNER=root:root  expected USER:GROUP of the socket and
+#                                      lock; its USER part is also the
+#                                      expected owner of the directory and
+#                                      transcript. Exists so a test tree
+#                                      built without root can be verified;
+#                                      do not set it in production.
+#   TMUX_SHARE_PYTHON=python3          interpreter for the connect probe
+set -eu
+
+HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+CORE_DIR=$(CDPATH= cd -- "$HERE/.." && pwd)
+
+DIR=${TMUX_SHARE_DIR:-/run/tmux-share}
+SOCK=${TMUX_SHARE_SOCK:-$DIR/tmux.sock}
+LOG=${TMUX_SHARE_LOG:-$DIR/transcript.log}
+LOCK=${TMUX_SHARE_LOCK:-/run/tmux-share.lock}
+STAMP=${TMUX_SHARE_STAMP:-$CORE_DIR/tmux-share-stamp}
+TIMEOUT=${TMUX_SHARE_TIMEOUT:-timeout}
+LIBDIR=${TMUX_SHARE_LIBDIR:-$CORE_DIR/lib}
+GROUP=${TMUX_SHARE_GROUP:-tmux-share}
+READER=${TMUX_SHARE_READER:-}
+BINDIR=${TMUX_SHARE_BINDIR:-$HERE}
+UNITDIR=${TMUX_SHARE_UNITDIR:-/etc/systemd/system}
+UNIT_TAP=${TMUX_SHARE_UNIT_TAP:-tmux-share-tap.service}
+UNIT_TRIM=${TMUX_SHARE_UNIT_TRIM:-tmux-share-trim.service}
+UNIT_SERVER=${TMUX_SHARE_UNIT_SERVER:-tmux-share-server.service}
+OWNER=${TMUX_SHARE_VERIFY_OWNER:-root:root}
+PYTHON=${TMUX_SHARE_PYTHON:-python3}
+
+prog=tmux-share-verify
+die() { printf '%s: %s\n' "$prog" "$1" >&2; exit 2; }
+
+case ${1:-} in
+    '') ;;
+    -h|--help)
+        sed -n '2,/^set -eu$/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
+        exit 0
+        ;;
+    *) die "unexpected argument '$1' (this command takes none; see --help)" ;;
+esac
+
+# shellcheck source=../lib/validate.sh
+. "$LIBDIR/validate.sh"
+# shellcheck source=../lib/checks.sh
+. "$LIBDIR/checks.sh"
+
+# ---- validate every configured value before it is used ---------------------
+for pair in "TMUX_SHARE_DIR:$DIR" "TMUX_SHARE_SOCK:$SOCK" "TMUX_SHARE_LOG:$LOG" \
+        "TMUX_SHARE_LOCK:$LOCK" "TMUX_SHARE_BINDIR:$BINDIR" \
+        "TMUX_SHARE_LIBDIR:$LIBDIR" "TMUX_SHARE_UNITDIR:$UNITDIR"; do
+    validate_log_path "${pair#*:}" || die "${pair%%:*} rejected: $VALIDATE_REASON"
+done
+for pair in "TMUX_SHARE_STAMP:$STAMP" "TMUX_SHARE_TIMEOUT:$TIMEOUT" \
+        "TMUX_SHARE_PYTHON:$PYTHON"; do
+    validate_exec_path "${pair#*:}" || die "${pair%%:*} rejected: $VALIDATE_REASON"
+done
+for pair in "TMUX_SHARE_UNIT_TAP:$UNIT_TAP" "TMUX_SHARE_UNIT_TRIM:$UNIT_TRIM" \
+        "TMUX_SHARE_UNIT_SERVER:$UNIT_SERVER"; do
+    validate_log_path "$UNITDIR/${pair#*:}" || die "${pair%%:*} rejected: $VALIDATE_REASON"
+    case ${pair#*:} in */*) die "${pair%%:*} rejected: must be a file name, not a path" ;; esac
+done
+
+# _account_ok NAME: a user or group name safe to hand to id(1) and compare.
+_account_ok() {
+    case $1 in
+        ''|-*|*[!A-Za-z0-9_.-]*) return 1 ;;
+    esac
+    return 0
+}
+_account_ok "$GROUP" || die "TMUX_SHARE_GROUP rejected: not a plain group name"
+case $OWNER in
+    ?*:?*) ;;
+    *) die "TMUX_SHARE_VERIFY_OWNER rejected: want USER:GROUP" ;;
+esac
+OWNER_USER=${OWNER%%:*}
+OWNER_GROUP=${OWNER#*:}
+_account_ok "$OWNER_USER" || die "TMUX_SHARE_VERIFY_OWNER rejected: bad user part"
+_account_ok "$OWNER_GROUP" || die "TMUX_SHARE_VERIFY_OWNER rejected: bad group part"
+if [ -n "$READER" ]; then
+    _account_ok "$READER" || die "TMUX_SHARE_READER rejected: not a plain account name"
+fi
+
+work=''
+cleanup() {
+    if [ -n "$work" ]; then rm -rf -- "$work"; fi
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# _need LABEL PATH: 0 if PATH exists; otherwise record a skip naming it.
+_need() {
+    if [ -e "$2" ] || [ -L "$2" ]; then
+        return 0
+    fi
+    check_skip "$1 $2 does not exist"
+    return 1
+}
+
+# ---- 1. deployment directory -----------------------------------------------
+check_begin deploy-dir-traversable-not-listable
+if _need 'deployment directory' "$DIR"; then
+    if [ ! -d "$DIR" ]; then
+        check_fail "$DIR is not a directory"
+    else
+        check_mode "$DIR" '0710|0750'
+        check_owner "$DIR" "$OWNER_USER:$GROUP"
+    fi
+fi
+
+# ---- 2. transcript ---------------------------------------------------------
+check_begin transcript-mode-owner
+if _need 'transcript' "$LOG"; then
+    if [ ! -f "$LOG" ]; then
+        check_fail "$LOG is not a regular file"
+    else
+        check_mode "$LOG" 0640
+        check_owner "$LOG" "$OWNER_USER:$GROUP"
+    fi
+fi
+
+# ---- 3. socket -------------------------------------------------------------
+check_begin socket-owner-only
+if _need 'socket' "$SOCK"; then
+    if [ ! -S "$SOCK" ]; then
+        check_fail "$SOCK is not a socket"
+    fi
+    check_mode "$SOCK" '0600|0700'
+    check_owner "$SOCK" "$OWNER"
+fi
+
+# ---- 4. lock file ----------------------------------------------------------
+check_begin lock-mode-owner
+if _need 'lock file' "$LOCK"; then
+    if [ ! -f "$LOCK" ]; then
+        check_fail "$LOCK is not a regular file"
+    else
+        check_mode "$LOCK" 0600
+        check_owner "$LOCK" "$OWNER"
+    fi
+fi
+
+# ---- 5. the reader cannot connect ------------------------------------------
+# The probe prints one word: CONNECTED, an errno name, TIMEOUT. It connects
+# and closes; it sends nothing.
+PROBE='
+import errno, socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(5)
+try:
+    s.connect(sys.argv[1])
+    print("CONNECTED")
+except OSError as e:
+    print(errno.errorcode.get(e.errno, "E%s" % e.errno) if e.errno else "TIMEOUT")
+finally:
+    s.close()
+'
+check_begin reader-cannot-connect-socket
+if _need 'socket' "$SOCK"; then
+    if [ "$(id -u)" -eq 0 ]; then
+        check_skip 'running as root, which can always connect whatever the socket mode; re-run as the reader account (or any non-root user)'
+    elif [ ! -S "$SOCK" ]; then
+        check_skip "$SOCK is not a socket, nothing to connect to"
+    elif ! py=$(command -v -- "$PYTHON" 2>/dev/null) || [ -z "$py" ]; then
+        check_skip "$PYTHON not found, cannot attempt a unix connect"
+    else
+        if ! result=$("$TIMEOUT" 10 "$py" -I -c "$PROBE" "$SOCK" 2>/dev/null); then
+            result=PROBE_ERROR
+        fi
+        case $result in
+            EACCES|EPERM)
+                check_pass
+                ;;
+            ENAMETOOLONG)
+                check_skip "socket path is too long for a unix connect ($result)"
+                ;;
+            CONNECTED|ECONNREFUSED)
+                if [ "$(stat -c '%u' -- "$SOCK" 2>/dev/null)" = "$(id -u)" ]; then
+                    check_skip 'the current user owns the socket, so being permitted says nothing about the reader; re-run as the reader account'
+                else
+                    check_fail "the current user was permitted to connect ($result); expected EACCES or EPERM"
+                fi
+                ;;
+            *)
+                check_fail "connect gave ${result:-no result}; expected EACCES or EPERM"
+                ;;
+        esac
+    fi
+fi
+
+# ---- 6. no pipe-pane with -o -----------------------------------------------
+# The pattern is assembled so that this file does not match itself, and
+# comment lines are ignored (the scripts document the rule in comments).
+_PP=pipe-pane
+# A standalone -o after pipe-pane, whether it is the first flag or a later
+# one. The earlier pattern required a second space before -o, so it
+# missed the commonest form, "pipe-pane -o -t %0 cmd", and reported a
+# toggle-carrying script as clean.
+_PP_O_RE="(^|[[:space:]])${_PP}([[:space:]]+[^[:space:]]+)*[[:space:]]+-[IOot]*o[IOot]*([[:space:]]|\$)"
+check_begin no-pipe-pane-dash-o
+scanned=0
+hits=''
+for d in "$BINDIR" "$LIBDIR"; do
+    [ -d "$d" ] || continue
+    scanned=$((scanned + 1))
+    found=$( { grep -rEnI -e "$_PP_O_RE" -- "$d" 2>/dev/null || true; } \
+        | { grep -Ev '^[^:]*:[0-9]+:[[:space:]]*#' || true; } )
+    if [ -n "$found" ]; then
+        hits=${hits:+$hits$'\n'}$found
+    fi
+done
+if [ "$scanned" -eq 0 ]; then
+    check_skip "script directory $BINDIR does not exist"
+elif [ -n "$hits" ]; then
+    first=${hits%%$'\n'*}
+    n=$(printf '%s\n' "$hits" | grep -c '' || true)
+    check_fail "$_PP with -o at ${first%%:*}:$(printf '%s' "${first#*:}" | { grep -o '^[0-9]*' || true; }) ($n occurrence(s)); a second -o detaches the tap"
+else
+    check_pass
+fi
+
+# ---- 7. systemd units ------------------------------------------------------
+# _unit_lines FILE: the unit file followed by its drop-ins, in order.
+_unit_lines() {
+    local x
+    cat -- "$1"
+    for x in "$1".d/*.conf; do
+        if [ -f "$x" ]; then cat -- "$x"; fi
+    done
+    return 0
+}
+
+# _trim VALUE: print VALUE without leading and trailing blanks.
+_trim() {
+    local v=$1
+    v=${v#"${v%%[![:space:]]*}"}
+    v=${v%"${v##*[![:space:]]}"}
+    printf '%s' "$v"
+}
+
+# _unit_value FILE KEY: the last value assigned to KEY (systemd: last wins).
+_unit_value() {
+    local l
+    l=$(_unit_lines "$1" | { grep -E "^[[:space:]]*$2[[:space:]]*=" || true; } | tail -n 1)
+    if [ -n "$l" ]; then _trim "${l#*=}"; fi
+    return 0
+}
+
+# _check_oneshot NAME UNITFILE
+_check_oneshot() {
+    local type
+    check_begin "$1"
+    if _need 'unit file' "$2"; then
+        type=$(_unit_value "$2" Type)
+        if [ "$type" = oneshot ]; then
+            check_pass
+        else
+            check_fail "Type=${type:-unset (systemd default is simple)}, expected oneshot"
+        fi
+    fi
+    return 0
+}
+
+_check_oneshot unit-tap-oneshot "$UNITDIR/$UNIT_TAP"
+_check_oneshot unit-trim-oneshot "$UNITDIR/$UNIT_TRIM"
+
+srv=$UNITDIR/$UNIT_SERVER
+check_begin unit-server-not-no-block-only
+if _need 'unit file' "$srv"; then
+    total=0
+    noblock=0
+    while IFS= read -r line; do
+        v=$(_trim "${line#*=}")
+        if [ -z "$v" ]; then
+            total=0          # an empty ExecStart= resets the list
+            noblock=0
+            continue
+        fi
+        total=$((total + 1))
+        case $v in
+            *--no-block*) noblock=$((noblock + 1)) ;;
+        esac
+    done <<EOF
+$(_unit_lines "$srv" | { grep -E '^[[:space:]]*ExecStart[[:space:]]*=' || true; })
+EOF
+    if [ "$total" -eq 0 ]; then
+        check_fail 'no ExecStart= line'
+    elif [ "$noblock" -eq "$total" ]; then
+        check_fail 'every ExecStart= goes through --no-block, so "started" is reported before the server is up'
+    else
+        check_pass
+    fi
+fi
+
+check_begin unit-server-no-umask-0077
+if _need 'unit file' "$srv"; then
+    um=$(_unit_value "$srv" UMask)
+    case $um in
+        0077|077|77)
+            check_fail "UMask=$um on the server leaks into the operator's shell"
+            ;;
+        *)
+            check_pass
+            ;;
+    esac
+fi
+
+# ---- 8. stamp filter -------------------------------------------------------
+check_begin stamp-filter-stamps-and-preserves-bytes
+stamp_path=$STAMP
+case $STAMP in
+    */*) ;;
+    *) stamp_path=$(command -v -- "$STAMP" 2>/dev/null || true) ;;
+esac
+if [ -z "$stamp_path" ] || [ ! -e "$stamp_path" ]; then
+    check_skip "stamp filter $STAMP does not exist"
+elif [ ! -f "$stamp_path" ] || [ ! -x "$stamp_path" ]; then
+    check_fail "$stamp_path is not an executable file"
+elif ! work=$(mktemp -d "${TMPDIR:-/tmp}/tmux-share-verify.XXXXXX" 2>/dev/null); then
+    work=''
+    check_fail 'cannot create a temporary directory to run the filter in'
+else
+    # Not valid UTF-8 (\377), a multibyte character, escapes and a tab.
+    printf 'tmux-share \303\251 \377 \033[1;31mred\033[0m\tend\n' > "$work/in"
+    rc=0
+    "$TIMEOUT" 5 env -u TMUX_SHARE_STAMP_GAP "$stamp_path" \
+        < "$work/in" > "$work/out" 2> "$work/err" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        check_fail "the filter exited with status $rc on one line of input"
+    else
+        isz=$(stat -c '%s' -- "$work/in")
+        osz=$(stat -c '%s' -- "$work/out")
+        plen=$((osz - isz))
+        if [ "$plen" -lt 0 ]; then
+            check_fail 'output is shorter than the input: bytes were dropped'
+        else
+            in_hex=$(od -An -v -tx1 -- "$work/in" | tr -d ' \n')
+            tail_hex=$(tail -c "$isz" -- "$work/out" | od -An -v -tx1 | tr -d ' \n')
+            if [ "$in_hex" != "$tail_hex" ]; then
+                check_fail 'the input bytes are not preserved at the end of the output'
+            elif [ "$plen" -eq 0 ]; then
+                check_fail 'no stamp was inserted: the line came out unchanged'
+            else
+                head_hex=$(head -c 2 -- "$work/out" | od -An -v -tx1 | tr -d ' \n')
+                text=$(head -c "$plen" -- "$work/out" | LC_ALL=C tr -d '\r\n')
+                stamp_re='^\[[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}\] $'
+                if [ "$head_hex" = 0d0a ] && [ "${#text}" -eq $((plen - 2)) ] \
+                        && [[ $text =~ $stamp_re ]]; then
+                    check_pass
+                else
+                    check_fail 'the bytes added before the line are not a CRLF plus [YYYY-MM-DD HH:MM:SS] stamp'
+                fi
+            fi
+        fi
+    fi
+fi
+
+# ---- 9. reader's groups ----------------------------------------------------
+check_begin reader-in-transcript-group
+if [ -z "$READER" ]; then
+    check_skip 'TMUX_SHARE_READER is not set, so there is no reader account to inspect'
+elif ! id -u -- "$READER" >/dev/null 2>&1; then
+    check_skip "reader account $READER does not exist"
+else
+    groups_line=$(id -Gn -- "$READER" 2>/dev/null || true)
+    read -r -a reader_groups <<EOF
+$groups_line
+EOF
+    in_group=0
+    for g in ${reader_groups[@]+"${reader_groups[@]}"}; do
+        if [ "$g" = "$GROUP" ]; then in_group=1; fi
+    done
+    if [ "$in_group" -eq 1 ]; then
+        check_pass
+    else
+        check_fail "reader account $READER is not in group $GROUP (it has: ${groups_line:-none})"
+    fi
+fi
+
+rc=0
+check_summary || rc=1
+exit "$rc"
