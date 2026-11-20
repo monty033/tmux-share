@@ -1,0 +1,392 @@
+#!/usr/bin/env bash
+# tmux-share-preflight: find out whether THIS tmux can do what the design
+# needs, by behaviour rather than by version number. Run it before a
+# non-Nix install and before CI runs the property suite.
+#
+# It starts a throwaway tmux server on a private socket in a private temp
+# directory, probes it, and removes everything again on every exit path.
+#
+# Usage: tmux-share-preflight [--json]
+#
+# Checks (each prints PASS, FAIL or WARN with what a failure means):
+#   1 pipe-pane-attach    pipe-pane can attach; bytes reach the tap
+#   2 pane-pipe-format    #{pane_pipe} reports the pipe state (0, then 1)
+#   3 pipe-pane-detach    pipe-pane with no command detaches; pane_pipe is 0
+#   4 pipe-pane-o-toggle  pipe-pane -o toggles (WARN, never a failure: it
+#                         documents why the scripts never use -o)
+#   5 list-panes-session  list-panes -s -t SESSION prints a pane id
+#   6 exit-empty-option   exit-empty can be set off, then on, and reads back
+#
+# THE REAL SERVER IS NEVER TOUCHED. The preflight refuses to run at all when
+# TMUX_SHARE_SOCK or TMUX_SHARE_DIR already exists: either one may belong to a
+# live deployment, and a stopped one is still not ours to probe. The probe
+# server lives in a mktemp directory and nothing else.
+#
+# Last line of output: PREFLIGHT: N passed, M failed, K warnings
+# With --json, stdout is one JSON object instead:
+#   {"status":"ok"|"fail","passed":N,"failed":M,"warnings":K,"checks":[...]}
+# A refusal or a bad configuration prints to stderr only.
+#
+# Environment (shared contract, see CORE-CONTRACT.md):
+#   TMUX_SHARE_DIR, TMUX_SHARE_SOCK, TMUX_SHARE_TMUX, TMUX_SHARE_TIMEOUT,
+#   TMUX_SHARE_LIBDIR. Also TMPDIR for the scratch directory.
+#
+# Exit status: 0 every required check passed (warnings do not count)
+#              1 at least one required check failed
+#              2 invalid configuration or usage (nothing was started)
+#              3 refused: the real socket or directory exists
+set -eu
+
+HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+# ---- shared contract (all overridable by environment) ----------------------
+TMUX_SHARE_DIR=${TMUX_SHARE_DIR:-/run/tmux-share}
+TMUX_SHARE_SOCK=${TMUX_SHARE_SOCK:-$TMUX_SHARE_DIR/tmux.sock}
+TMUX_SHARE_TMUX=${TMUX_SHARE_TMUX:-tmux}
+TMUX_SHARE_TIMEOUT=${TMUX_SHARE_TIMEOUT:-timeout}
+TMUX_SHARE_LIBDIR=${TMUX_SHARE_LIBDIR:-$HERE/../lib}
+
+REAL_DIR=$TMUX_SHARE_DIR
+REAL_SOCK=$TMUX_SHARE_SOCK
+TMUX=$TMUX_SHARE_TMUX
+TIMEOUT=$TMUX_SHARE_TIMEOUT
+
+SESSION=preflight
+TMUX_SECS=5            # bound for every tmux call
+BYTES_TRIES=50         # polls for tap output
+BYTES_STEP=0.1         # seconds between polls
+
+# shellcheck source=../lib/validate.sh
+. "$TMUX_SHARE_LIBDIR/validate.sh"
+
+log() { printf 'tmux-share-preflight: %s\n' "$*" >&2; }
+die() { log "$1"; exit "${2:-2}"; }
+
+# ---- arguments --------------------------------------------------------------
+JSON=0
+while [ "$#" -gt 0 ]; do
+    case $1 in
+        --json) JSON=1 ;;
+        -h | --help)
+            printf 'usage: tmux-share-preflight [--json]\n'
+            exit 0
+            ;;
+        *) die "unknown argument: $1 (usage: tmux-share-preflight [--json])" 2 ;;
+    esac
+    shift
+done
+
+# ---- 1. validate every path before it is used -------------------------------
+if ! validate_exec_path "$TMUX"; then
+    die "invalid tmux program path: $(validate_reason)" 2
+fi
+if ! validate_exec_path "$TIMEOUT"; then
+    die "invalid timeout program path: $(validate_reason)" 2
+fi
+if ! validate_log_path "$REAL_DIR"; then
+    die "invalid TMUX_SHARE_DIR: $(validate_reason)" 2
+fi
+if ! validate_log_path "$REAL_SOCK"; then
+    die "invalid TMUX_SHARE_SOCK: $(validate_reason)" 2
+fi
+
+# ---- 2. never touch a real deployment ---------------------------------------
+if [ -e "$REAL_SOCK" ] || [ -L "$REAL_SOCK" ]; then
+    die "REFUSING TO RUN: TMUX_SHARE_SOCK ($REAL_SOCK) already exists; it may belong to a live deployment and the preflight never touches the real server" 3
+fi
+if [ -e "$REAL_DIR" ] || [ -L "$REAL_DIR" ]; then
+    die "REFUSING TO RUN: TMUX_SHARE_DIR ($REAL_DIR) already exists; it may belong to a live deployment and the preflight never touches the real server" 3
+fi
+
+# ---- 3. scratch space and the EXIT trap -------------------------------------
+SCRATCH_DIR=''
+SCRATCH_SOCK=''
+SERVER_PID=''
+
+cleanup() {
+    local rc=$? tries=0
+    trap - EXIT
+    if [ -n "$SCRATCH_SOCK" ]; then
+        "$TIMEOUT" "$TMUX_SECS" "$TMUX" -S "$SCRATCH_SOCK" kill-server \
+            </dev/null >/dev/null 2>&1 || true
+    fi
+    # Belt and braces: if the server pid is known and still alive, end it.
+    case $SERVER_PID in
+        '' | *[!0-9]*) ;;
+        *)
+            while [ "$tries" -lt 20 ] && kill -0 "$SERVER_PID" 2>/dev/null; do
+                tries=$((tries + 1))
+                sleep 0.1
+            done
+            if kill -0 "$SERVER_PID" 2>/dev/null; then
+                kill "$SERVER_PID" 2>/dev/null || true
+                sleep 0.2
+                kill -9 "$SERVER_PID" 2>/dev/null || true
+            fi
+            ;;
+    esac
+    if [ -n "$SCRATCH_DIR" ]; then
+        rm -rf -- "$SCRATCH_DIR"
+    fi
+    exit "$rc"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
+SCRATCH_DIR=$(mktemp -d "${TMPDIR:-/tmp}/tmux-share-preflight.XXXXXX") \
+    || die "cannot create a scratch directory" 2
+if ! validate_log_path "$SCRATCH_DIR"; then
+    die "scratch directory path is not usable ($(validate_reason)); set TMPDIR to a plain absolute path" 2
+fi
+SCRATCH_SOCK=$SCRATCH_DIR/probe.sock
+TAP1=$SCRATCH_DIR/tap1.out
+TAP2=$SCRATCH_DIR/tap2.out
+ERRF=$SCRATCH_DIR/err
+: > "$ERRF"
+
+# A server started from inside tmux must not inherit the outer client.
+unset TMUX_PANE 2>/dev/null || true
+
+# tm ARGS...: one bounded call against the scratch server only.
+tm() {
+    "$TIMEOUT" "$TMUX_SECS" "$TMUX" -S "$SCRATCH_SOCK" "$@" </dev/null
+}
+
+# one_line TEXT: collapse newlines and tabs, trim to a sane length.
+one_line() {
+    local s=$1
+    s=${s//$'\n'/ }
+    s=${s//$'\t'/ }
+    printf '%.200s' "$s"
+}
+
+last_err() { one_line "$(head -c 300 "$ERRF" 2>/dev/null || true)"; }
+
+# ---- result bookkeeping -----------------------------------------------------
+NAME=() STATUS=() DETAIL=() MEANING=()
+PASSED=0 FAILED=0 WARNED=0
+
+# record IDX NAME STATUS DETAIL MEANING
+record() {
+    NAME[$1]=$2
+    STATUS[$1]=$3
+    DETAIL[$1]=$(one_line "$4")
+    MEANING[$1]=$5
+    case $3 in
+        PASS) PASSED=$((PASSED + 1)) ;;
+        FAIL) FAILED=$((FAILED + 1)) ;;
+        WARN) WARNED=$((WARNED + 1)) ;;
+    esac
+}
+
+# pipe_state PANE: print the pane's #{pane_pipe}, read the way the watchdog
+# reads it (list-panes -s -t SESSION). Fails if the pane is not listed.
+pipe_state() {
+    local out id v
+    out=$(tm list-panes -s -t "$SESSION" -F '#{pane_id} #{pane_pipe}' 2> "$ERRF") || return 1
+    while read -r id v; do
+        if [ "$id" = "$1" ]; then
+            printf '%s' "$v"
+            return 0
+        fi
+    done <<EOF
+$out
+EOF
+    return 1
+}
+
+# ---- 4. start the throwaway server ------------------------------------------
+PANE=''
+SERVER_OK=0
+if tm -f /dev/null new-session -d -s "$SESSION" -c /tmp 2> "$ERRF"; then
+    SERVER_OK=1
+    pid=$(tm display-message -p -t "$SESSION" '#{pid}' 2>/dev/null) || pid=''
+    case $pid in
+        '' | *[!0-9]*) ;;
+        *) SERVER_PID=$pid ;;
+    esac
+else
+    record 0 scratch-server FAIL "could not start a scratch server: $(last_err)" \
+        "this tmux cannot run a throwaway server, so none of the behaviour below can be verified"
+fi
+
+# ---- 5. probes ---------------------------------------------------------------
+if [ "$SERVER_OK" -eq 1 ]; then
+    # Check 5 first: every other probe needs the pane id it finds.
+    if ids=$(tm list-panes -s -t "$SESSION" -F '#{pane_id}' 2> "$ERRF"); then
+        first=${ids%%$'\n'*}
+        # Only the first field is the id; a test double may print more.
+        first=${first%% *}
+        case $first in
+            %[0-9] | %[0-9][0-9] | %[0-9][0-9][0-9] | %[0-9][0-9][0-9][0-9])
+                PANE=$first
+                record 5 list-panes-session PASS "list-panes -s -t $SESSION printed pane id $PANE" \
+                    "the watchdog and tap-start enumerate panes this way; without it no pane could ever be tapped"
+                ;;
+            *)
+                record 5 list-panes-session FAIL "list-panes -s -t $SESSION printed no pane id (got '$(one_line "$first")')" \
+                    "the watchdog and tap-start enumerate panes this way; without it no pane could ever be tapped"
+                ;;
+        esac
+    else
+        record 5 list-panes-session FAIL "list-panes -s -t $SESSION failed: $(last_err)" \
+            "the watchdog and tap-start enumerate panes this way; without it no pane could ever be tapped"
+    fi
+fi
+
+NOPANE='not run: no pane id (check 5 or the scratch server failed)'
+M1='the transcript tap cannot be attached, so nothing would ever be recorded'
+M2='the watchdog cannot tell a tapped pane from an untapped one, so it risks the pipe-pane toggle trap'
+M3='the watchdog cannot retire a stale tap, so a rebuild after a deleted log cannot recover'
+M4='informational: the scripts never use -o, so this never fails the run; a second -o call would detach the tap and stop recording'
+M6='the server may exit when its last session closes, or the option is unavailable, so the shared server would not stay up'
+
+if [ -z "$PANE" ]; then
+    for i in 1 2 3 4 6; do
+        case $i in
+            1) n=pipe-pane-attach m=$M1 ;;
+            2) n=pane-pipe-format m=$M2 ;;
+            3) n=pipe-pane-detach m=$M3 ;;
+            4) n=pipe-pane-o-toggle m=$M4 ;;
+            6) n=exit-empty-option m=$M6 ;;
+        esac
+        if [ "$i" -eq 4 ]; then
+            # Check 4 is warning-level even when it could not run.
+            record "$i" "$n" WARN "$NOPANE" "$m"
+        else
+            record "$i" "$n" FAIL "$NOPANE" "$m"
+        fi
+    done
+else
+    # -- check 1: attach, generate output, confirm bytes arrive
+    before=$(pipe_state "$PANE") || before=ERR
+    : > "$TAP1"
+    if ! tm pipe-pane -t "$PANE" "exec cat >> $TAP1" 2> "$ERRF"; then
+        record 1 pipe-pane-attach FAIL "pipe-pane failed: $(last_err)" "$M1"
+    else
+        tm send-keys -t "$PANE" 'echo preflight-marker' Enter 2> "$ERRF" || true
+        tries=0
+        got=0
+        while [ "$tries" -lt "$BYTES_TRIES" ]; do
+            if grep -q 'preflight-marker' "$TAP1" 2>/dev/null; then
+                got=1
+                break
+            fi
+            tries=$((tries + 1))
+            sleep "$BYTES_STEP"
+        done
+        if [ "$got" -eq 1 ]; then
+            record 1 pipe-pane-attach PASS "pipe-pane attached and the generated output reached the tap file" "$M1"
+        else
+            record 1 pipe-pane-attach FAIL "pipe-pane attached but no output reached the tap file within the wait" "$M1"
+        fi
+    fi
+
+    # -- check 2: pane_pipe reports 0 before the tap and 1 after
+    after=$(pipe_state "$PANE") || after=ERR
+    if [ "$before" = 0 ] && [ "$after" = 1 ]; then
+        record 2 pane-pipe-format PASS "#{pane_pipe} read $before before the tap and $after after it" "$M2"
+    else
+        record 2 pane-pipe-format FAIL "#{pane_pipe} read '$before' before the tap and '$after' after it (expected 0 then 1)" "$M2"
+    fi
+
+    # -- check 3: pipe-pane with no command detaches
+    if ! tm pipe-pane -t "$PANE" 2> "$ERRF"; then
+        record 3 pipe-pane-detach FAIL "pipe-pane with no command failed: $(last_err)" "$M3"
+    else
+        detached=$(pipe_state "$PANE") || detached=ERR
+        if [ "$detached" = 0 ]; then
+            record 3 pipe-pane-detach PASS "pipe-pane with no command detached the tap; #{pane_pipe} reads 0" "$M3"
+        else
+            record 3 pipe-pane-detach FAIL "#{pane_pipe} reads '$detached' after pipe-pane with no command (expected 0)" "$M3"
+        fi
+    fi
+
+    # -- check 4: pipe-pane -o called twice (warning-level)
+    s0=$(pipe_state "$PANE") || s0=ERR
+    s1=ERR s2=ERR
+    if tm pipe-pane -o -t "$PANE" "exec cat >> $TAP2" 2> "$ERRF"; then
+        s1=$(pipe_state "$PANE") || s1=ERR
+    fi
+    if tm pipe-pane -o -t "$PANE" "exec cat >> $TAP2" 2> "$ERRF"; then
+        s2=$(pipe_state "$PANE") || s2=ERR
+    fi
+    seq="pane_pipe $s0 -> $s1 -> $s2 over two calls"
+    if [ "$s0" = 0 ] && [ "$s1" = 1 ] && [ "$s2" = 0 ]; then
+        record 4 pipe-pane-o-toggle WARN "-o is a toggle here ($seq): the second call detached the tap" "$M4"
+    elif [ "$s0" = 0 ] && [ "$s1" = 1 ] && [ "$s2" = 1 ]; then
+        record 4 pipe-pane-o-toggle PASS "-o did not toggle on this tmux ($seq); the scripts still never use it" "$M4"
+    else
+        record 4 pipe-pane-o-toggle WARN "-o behaved unexpectedly ($seq); the scripts never use it" "$M4"
+    fi
+    # Leave the pane untapped whatever check 4 did.
+    tm pipe-pane -t "$PANE" 2>/dev/null || true
+
+    # -- check 6: exit-empty can be set off and back on, and reads back
+    v_off=ERR v_on=ERR
+    if tm set-option -g exit-empty off 2> "$ERRF"; then
+        v_off=$(tm show-options -gv exit-empty 2>/dev/null) || v_off=ERR
+    fi
+    if tm set-option -g exit-empty on 2> "$ERRF"; then
+        v_on=$(tm show-options -gv exit-empty 2>/dev/null) || v_on=ERR
+    fi
+    if [ "$v_off" = off ] && [ "$v_on" = on ]; then
+        record 6 exit-empty-option PASS "exit-empty read back '$v_off' after 'off' and '$v_on' after 'on'" "$M6"
+    else
+        record 6 exit-empty-option FAIL "exit-empty read back '$v_off' after 'off' and '$v_on' after 'on'" "$M6"
+    fi
+fi
+
+# ---- 6. report --------------------------------------------------------------
+if [ "$FAILED" -eq 0 ]; then
+    OVERALL=ok
+else
+    OVERALL=fail
+fi
+
+json_str() {
+    local s=$1
+    s=$(printf '%s' "$s" | tr -d '\000-\010\013-\037')
+    s=${s//\\/\\\\}
+    s=${s//\"/\\\"}
+    s=${s//$'\n'/\\n}
+    s=${s//$'\t'/\\t}
+    printf '"%s"' "$s"
+}
+
+if [ "$JSON" -eq 1 ]; then
+    printf '{"status":"%s","passed":%d,"failed":%d,"warnings":%d,"checks":[' \
+        "$OVERALL" "$PASSED" "$FAILED" "$WARNED"
+    sep=''
+    for i in 0 1 2 3 4 5 6; do
+        [ -n "${NAME[$i]:-}" ] || continue
+        st=$(printf '%s' "${STATUS[$i]}" | tr 'A-Z' 'a-z')
+        printf '%s{"id":%d,"name":%s,"status":"%s","detail":%s,"meaning":%s}' \
+            "$sep" "$i" "$(json_str "${NAME[$i]}")" "$st" \
+            "$(json_str "${DETAIL[$i]}")" "$(json_str "${MEANING[$i]}")"
+        sep=','
+    done
+    printf ']}\n'
+else
+    for i in 0 1 2 3 4 5 6; do
+        [ -n "${NAME[$i]:-}" ] || continue
+        printf '%s %s: %s\n' "${STATUS[$i]}" "${NAME[$i]}" "${DETAIL[$i]}"
+        printf '     meaning of a failure: %s\n' "${MEANING[$i]}"
+    done
+    if [ "$WARNED" -gt 0 ]; then
+        printf 'Warnings:\n'
+        for i in 0 1 2 3 4 5 6; do
+            if [ "${STATUS[$i]:-}" = WARN ]; then
+                printf '  %s: %s\n' "${NAME[$i]}" "${DETAIL[$i]}"
+            fi
+        done
+    fi
+    printf 'PREFLIGHT: %d passed, %d failed, %d warnings\n' "$PASSED" "$FAILED" "$WARNED"
+fi
+
+if [ "$FAILED" -eq 0 ]; then
+    exit 0
+fi
+exit 1
