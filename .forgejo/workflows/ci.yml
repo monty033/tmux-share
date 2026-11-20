@@ -6,16 +6,18 @@ name: ci
 
 jobs:
   test:
-    runs-on: docker
-    container:
-      image: node:22-bookworm
+    # The runner declares "ubuntu-latest:docker://node:18-bullseye", so the
+    # container image comes from the label itself. Naming a second image here
+    # would be ignored at best; asking for a "docker" label matched no runner at
+    # all and the job sat in waiting indefinitely.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Install the tools the suites use
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends tmux python3 util-linux curl ca-certificates fish
+          apt-get install -y --no-install-recommends tmux python3 util-linux curl ca-certificates
           tmux -V
           python3 --version
 
