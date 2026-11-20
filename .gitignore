@@ -1,0 +1,14 @@
+# Local evidence and briefs must never enter the repository.
+evidence/
+BRIEF.md
+*.brief.md
+.env
+
+# Editor and operating-system noise.
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/

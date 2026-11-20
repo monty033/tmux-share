@@ -1,0 +1,219 @@
+#!/usr/bin/env bash
+# fake-tmux: a state-file-backed test double for the tmux bits exercised by
+# the watchdog and the trimmer. No real tmux server and no root are needed.
+#
+# State directory: $FAKE_TMUX_STATE. When it is unset, a temp dir is created
+# and its path is printed once (on stdout) so a caller can capture it.
+#
+# Files inside the state directory (all stable, tab-separated where relevant):
+#   state     - authoritative pane table, one "PANE<TAB>PIPE" line per pane
+#   sessions  - one known session name per line
+#   commands  - "PANE<TAB>COMMAND" recorded by pipe-pane
+#   calls.log - "RC<TAB>ARGS<TAB>RESULTING_STATE", one line per invocation
+#
+# Supported subcommands: list-panes, pipe-pane. Anything else exits 2.
+set -eu
+
+# ---- state directory -------------------------------------------------------
+created_state=0
+if [ -z "${FAKE_TMUX_STATE:-}" ]; then
+    FAKE_TMUX_STATE=$(mktemp -d "${TMPDIR:-/tmp}/fake-tmux.XXXXXX")
+    created_state=1
+fi
+mkdir -p -- "$FAKE_TMUX_STATE"
+
+state_file=$FAKE_TMUX_STATE/state
+sessions_file=$FAKE_TMUX_STATE/sessions
+commands_file=$FAKE_TMUX_STATE/commands
+log_file=$FAKE_TMUX_STATE/calls.log
+
+[ -e "$state_file" ]    || : > "$state_file"
+[ -e "$sessions_file" ] || : > "$sessions_file"
+[ -e "$commands_file" ] || : > "$commands_file"
+[ -e "$log_file" ]      || : > "$log_file"
+
+# ---- helpers ---------------------------------------------------------------
+get_pipe() {
+    local wanted=$1 p v
+    while IFS=$'\t' read -r p v; do
+        if [ "$p" = "$wanted" ]; then
+            printf '%s' "$v"
+            return 0
+        fi
+    done < "$state_file"
+    printf '0'
+}
+
+set_pipe() {
+    local pane=$1 val=$2 p v found=0
+    local tmp=$state_file.tmp.$$
+    : > "$tmp"
+    while IFS=$'\t' read -r p v; do
+        if [ "$p" = "$pane" ]; then
+            printf '%s\t%s\n' "$p" "$val"
+            found=1
+        else
+            printf '%s\t%s\n' "$p" "$v"
+        fi
+    done < "$state_file" >> "$tmp"
+    if [ "$found" -eq 0 ]; then
+        printf '%s\t%s\n' "$pane" "$val" >> "$tmp"
+    fi
+    mv -- "$tmp" "$state_file"
+}
+
+record_command() {
+    local pane=$1 cmd=$2 p c found=0
+    local tmp=$commands_file.tmp.$$
+    : > "$tmp"
+    while IFS=$'\t' read -r p c; do
+        if [ "$p" = "$pane" ]; then
+            printf '%s\t%s\n' "$p" "$cmd"
+            found=1
+        else
+            printf '%s\t%s\n' "$p" "$c"
+        fi
+    done < "$commands_file" >> "$tmp"
+    if [ "$found" -eq 0 ]; then
+        printf '%s\t%s\n' "$pane" "$cmd" >> "$tmp"
+    fi
+    mv -- "$tmp" "$commands_file"
+}
+
+session_known() {
+    local wanted=$1 s
+    while IFS= read -r s; do
+        if [ "$s" = "$wanted" ]; then
+            return 0
+        fi
+    done < "$sessions_file"
+    return 1
+}
+
+state_summary() {
+    local out="" p v
+    while IFS=$'\t' read -r p v; do
+        if [ -n "$out" ]; then
+            out+=","
+        fi
+        out+="$p=$v"
+    done < "$state_file"
+    printf '%s' "$out"
+}
+
+# ---- parse one invocation --------------------------------------------------
+orig_args=$*
+log_call() {
+    printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$log_file"
+}
+
+out=""
+err=""
+rc=0
+sub=${1:-}
+if [ "$#" -gt 0 ]; then
+    shift
+fi
+
+case "$sub" in
+    list-panes)
+        session=""
+        while [ "$#" -gt 0 ]; do
+            case "$1" in
+                -t)
+                    if [ "$#" -ge 2 ]; then session=$2; shift 2; else shift; fi
+                    ;;
+                -F)
+                    if [ "$#" -ge 2 ]; then shift 2; else shift; fi
+                    ;;
+                -s|-t*) shift ;;
+                *) shift ;;
+            esac
+        done
+        if ! session_known "$session"; then
+            err+="can't find session: $session"$'\n'
+            rc=1
+        else
+            while IFS=$'\t' read -r p v; do
+                out+="$p $v"$'\n'
+            done < "$state_file"
+        fi
+        ;;
+
+    pipe-pane)
+        toggle=0
+        pane=""
+        cmd=""
+        cmd_set=0
+        while [ "$#" -gt 0 ]; do
+            case "$1" in
+                -o) toggle=1; shift ;;
+                -t)
+                    if [ "$#" -ge 2 ]; then pane=$2; shift 2; else shift; fi
+                    ;;
+                --|-*) shift ;;
+                *) cmd=$1; cmd_set=1; shift ;;
+            esac
+        done
+        if [ -z "$pane" ]; then
+            err+="pipe-pane: missing pane id"$'\n'
+            rc=1
+        else
+            cur=$(get_pipe "$pane")
+            if [ "$toggle" -eq 1 ]; then
+                # Real tmux -o toggles: doing it twice detaches the tap and
+                # silently stops recording. This is the trap we model.
+                if [ "$cur" = "1" ]; then
+                    set_pipe "$pane" 0
+                else
+                    set_pipe "$pane" 1
+                    if [ "$cmd_set" -eq 1 ]; then
+                        record_command "$pane" "$cmd"
+                    fi
+                fi
+            elif [ "$cmd_set" -eq 1 ]; then
+                set_pipe "$pane" 1
+                record_command "$pane" "$cmd"
+            else
+                set_pipe "$pane" 0
+            fi
+        fi
+        ;;
+
+    *)
+        err+="unsupported subcommand: $sub"$'\n'
+        rc=2
+        ;;
+esac
+
+# ---- optional fault injection ---------------------------------------------
+if [ -n "${FAKE_TMUX_RC:-}" ]; then
+    rc=$FAKE_TMUX_RC
+fi
+if [ -n "${FAKE_TMUX_STDERR:-}" ]; then
+    if [ -n "$err" ]; then
+        err=$FAKE_TMUX_STDERR$'\n'"$err"
+    else
+        err=$FAKE_TMUX_STDERR
+    fi
+fi
+
+# Log *before* sleeping: a call killed by timeout still leaves a trace, and
+# the log records the exit code fake-tmux intended to return.
+log_call "$rc" "$orig_args" "$(state_summary)"
+
+if [ -n "${FAKE_TMUX_SLEEP:-}" ]; then
+    sleep_pid=""
+    trap 'if [ -n "$sleep_pid" ]; then kill "$sleep_pid" 2>/dev/null || true; fi; exit 143' TERM INT
+    sleep "$FAKE_TMUX_SLEEP" & sleep_pid=$!
+    wait "$sleep_pid" || true
+fi
+
+printf '%s' "$out"
+printf '%s' "$err" >&2
+
+if [ "$created_state" -eq 1 ]; then
+    printf '%s\n' "$FAKE_TMUX_STATE"
+fi
+
+exit "$rc"
