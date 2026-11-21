@@ -259,6 +259,26 @@ run_selftest badarg -- --bogus
 expect badarg-exits-2 test "$RC" -eq 2
 expect badarg-says-usage grep -q 'usage: tmux-share-selftest' "$OUT"
 
+# ---- 7b. the verifier step compares against the account that runs the server
+# The self-test builds its scratch tree as the invoking account and tells the
+# verifier that account owns it. A fake id that names someone else makes the
+# expected owner wrong, so the verifier must fail: if the step ever fell back to
+# comparing against a literal root, or skipped the owner check, this would pass.
+make_standin wrongowner 0
+mkdir -p -- "$TOP/fakeid"
+REAL_ID=$(command -v id)
+cat > "$TOP/fakeid/id" <<FAKE_ID
+#!/bin/sh
+if [ "\$*" = "-un" ]; then echo notme; exit 0; fi
+exec $REAL_ID "\$@"
+FAKE_ID
+chmod 0755 -- "$TOP/fakeid/id"
+run_selftest wrongowner "TMUX_SHARE_TMUX=$STANDIN" "PATH=$TOP/fakeid:$PATH"
+expect wrongowner-exits-nonzero test "$RC" -ne 0
+expect wrongowner-reports-verifier-failure grep -q '^FAIL verifier-clean' "$OUT"
+expect wrongowner-names-the-expected-owner grep -q 'expected notme:' "$OUT"
+expect wrongowner-leaves-no-temp-dir tmp_is_empty
+
 # ---- 8. the deployment and sentinels were never touched --------------------
 expect sentinels-still-intact sentinels_intact
 expect deployment-holds-only-what-the-test-made \

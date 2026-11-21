@@ -77,15 +77,23 @@ UNITS=(
 )
 MOD_DIR=$work/mod
 TPL_DIR=$repo_root/systemd
+# The same module with services.tmux-share.user = "alice", and what install.sh
+# --user alice writes for it: the non-root pair that is compared the same way.
+ALICE_MOD_DIR=$work/mod-alice
+ALICE_TPL_DIR=$work/tpl-alice/etc/systemd/system
+ALICE_TMPFILES=$work/tpl-alice/etc/tmpfiles.d/tmux-share.conf
+ALICE_ENV=$work/tpl-alice/etc/tmux-share/env
+ALICE_EXTRA='{ services.tmux-share.user = "alice"; users.users.alice = { isNormalUser = true; home = "/srv/alice"; }; }'
 
 # The module, applied to the flake's nixosModules.default. It builds a minimal
 # NixOS system around the module (the same settings as the flake's own
 # module-renders check) and prints each rendered file as a "@@ NAME" section.
 # Store paths are discarded from the string context: this reads text and runs
 # nothing. The nixpkgs tree comes from TMUX_SHARE_PARITY_NIXPKGS, which the
-# suite sets to the same tree the flake was locked against.
+# suite sets to the same tree the flake was locked against. `extra` is one more
+# module merged in, so a case can set an option without a second copy of this.
 read -r -d '' APPLY <<'NIX' || true
-mod:
+mod: extra:
 let
   p = builtins.getEnv "TMUX_SHARE_PARITY_NIXPKGS";
   lib = import (p + "/lib");
@@ -93,6 +101,7 @@ let
     system = builtins.currentSystem;
     modules = [
       mod
+      extra
       {
         services.tmux-share.enable = true;
         boot.loader.grub.enable = false;
@@ -175,33 +184,34 @@ resolve_nixpkgs() {
     return 0
 }
 
-# evaluate_module: render the module into $work/module.txt. --no-write-lock-file
-# keeps the flake lock untouched whatever the override says.
+# evaluate_module OUTFILE EXTRA: render the module, with the extra module EXTRA
+# (a Nix expression) merged in, into OUTFILE. --no-write-lock-file keeps the
+# flake lock untouched whatever the override says.
 evaluate_module() {
     local rc=0
     (cd -- "$repo_root" && TMUX_SHARE_PARITY_NIXPKGS=$nixpkgs_dir nix \
         --extra-experimental-features 'nix-command flakes' \
         eval --raw --no-write-lock-file --impure ${override[@]+"${override[@]}"} \
-        '.#nixosModules.default' --apply "$APPLY" \
-        > "$work/module.txt" 2> "$work/eval.err") || rc=$?
+        '.#nixosModules.default' --apply "m: ($APPLY) m ($2)" \
+        > "$1" 2> "$work/eval.err") || rc=$?
     if [ "$rc" -ne 0 ]; then
         eval_failure 'evaluating the module' "$work/eval.err"
     fi
     return 0
 }
 
-# load_module: split the printed sections into files under $MOD_DIR.
+# load_module TXT DIR: split the printed sections of TXT into files under DIR.
 load_module() {
     local line name='' s
-    mkdir -p -- "$MOD_DIR"
+    mkdir -p -- "$2"
     while IFS= read -r line || [ -n "$line" ]; do
         case $line in
-            '@@ '*) name=${line#@@ }; : > "$MOD_DIR/$name"; continue ;;
+            '@@ '*) name=${line#@@ }; : > "$2/$name"; continue ;;
         esac
-        if [ -n "$name" ]; then printf '%s\n' "$line" >> "$MOD_DIR/$name"; fi
-    done < "$work/module.txt"
+        if [ -n "$name" ]; then printf '%s\n' "$line" >> "$2/$name"; fi
+    done < "$1"
     for s in "${SECTIONS[@]}"; do
-        if [ ! -f "$MOD_DIR/$s" ]; then
+        if [ ! -f "$2/$s" ]; then
             FAIL_ALL="the module output has no $s section"
             return 0
         fi
@@ -364,6 +374,51 @@ rule_agree() {
     want "$3 mode in the template" "$tmode" "$2"
 }
 
+# service_user FILE: the account a service unit runs as. systemd runs a unit
+# as root when User= is absent, so absent reads as root; a User= outside
+# [Service] is not read by systemd and is reported as "?outside-service".
+service_user() {
+    local u in_service
+    u=$(ini "$1" User)
+    if [ -z "$u" ]; then printf 'root'; return 0; fi
+    in_service=$(awk '/^\[/ { s = $0 } /^[[:space:]]*User=/ { print s }' "$1" | tail -n 1)
+    if [ "$in_service" != '[Service]' ]; then printf '?outside-service'; return 0; fi
+    printf '%s' "$u"
+}
+
+# rule_owner FILE PATH: "USER GROUP" of the tmpfiles rule for PATH.
+rule_owner() {
+    local rule
+    local -a f=()
+    rule=$(tmpfiles_rule "$1" "$2")
+    read -r -a f <<< "$rule" || true
+    printf '%s %s' "${f[3]:-}" "${f[4]:-}"
+}
+
+# build_alice_templates: what install.sh --user alice writes, under a scratch
+# prefix. getent is a stand-in that knows alice: the real one answers for the
+# host, which has no such account, and this suite must not need one.
+build_alice_templates() {
+    local real
+    real=$(command -v getent) || real=''
+    mkdir -p -- "$work/stubs" "$work/tpl-alice-tmp"
+    cat > "$work/stubs/getent" <<EOF
+#!/bin/sh
+# A normal account: primary group "users" (gid 100), none named after it.
+case "\$1 \$2" in
+    "passwd alice") echo "alice:x:1002:100::/srv/alice:/bin/sh"; exit 0 ;;
+    "group 100") echo "users:x:100:"; exit 0 ;;
+esac
+exec ${real:-false} "\$@"
+EOF
+    chmod 0755 "$work/stubs/getent"
+    if ! env -i PATH="$work/stubs:$PATH" TMPDIR="$work/tpl-alice-tmp" \
+            "$repo_root/install.sh" --force --user alice --prefix "$work/tpl-alice" \
+            > "$work/install-alice.out" 2>&1; then
+        FAIL_ALL="install.sh --user alice failed: $(tail -n 3 "$work/install-alice.out" | tr '\n' ' ')"
+    fi
+}
+
 # ---- the checks ---------------------------------------------------------------
 
 c_server_exec() {
@@ -485,7 +540,51 @@ c_lock_mode() {
     rule_agree /run/tmux-share.lock 0600 lock
 }
 
+c_user_root() {
+    begin 'module and template agree: default account is root' || return 0
+    local u
+    for u in tmux-share-server.service tmux-share-tap.service tmux-share-trim.service; do
+        agree "$u runs as" "$(service_user "$MOD_DIR/$u")" "$(service_user "$TPL_DIR/$u")"
+        want "$u runs as root by default" "$(service_user "$TPL_DIR/$u")" root
+    done
+    local path
+    for path in /run/tmux-share /run/tmux-share/transcript.log /run/tmux-share.lock; do
+        agree "$path owner and group" \
+            "$(rule_owner "$MOD_DIR/tmux-share.tmpfiles" "$path")" \
+            "$(rule_owner "$TPL_DIR/tmux-share.tmpfiles" "$path")"
+    done
+    want 'directory owner and group by default' "$(rule_owner "$TPL_DIR/tmux-share.tmpfiles" /run/tmux-share)" 'root tmux-share'
+    want 'transcript owner and group by default' "$(rule_owner "$TPL_DIR/tmux-share.tmpfiles" /run/tmux-share/transcript.log)" 'root tmux-share'
+    want 'lock owner and group by default' "$(rule_owner "$TPL_DIR/tmux-share.tmpfiles" /run/tmux-share.lock)" 'root root'
+}
+
+c_user_alice() {
+    begin 'module and install.sh agree: user alice' || return 0
+    local u path
+    for u in tmux-share-server.service tmux-share-tap.service tmux-share-trim.service; do
+        agree "$u runs as" "$(service_user "$ALICE_MOD_DIR/$u")" "$(service_user "$ALICE_TPL_DIR/$u")"
+        want "$u runs as alice" "$(service_user "$ALICE_TPL_DIR/$u")" alice
+    done
+    for u in tmux-share-tap.timer tmux-share-trim.timer; do
+        want "module $u takes no User=" "$(grep -c '^User=' "$ALICE_MOD_DIR/$u" || true)" 0
+    done
+    for path in /run/tmux-share /run/tmux-share/transcript.log /run/tmux-share.lock; do
+        agree "$path rule (owner, group, mode)" \
+            "$(tmpfiles_rule "$ALICE_MOD_DIR/tmux-share.tmpfiles" "$path")" \
+            "$(tmpfiles_rule "$ALICE_TMPFILES" "$path")"
+    done
+    want 'directory owner and group for alice' "$(rule_owner "$ALICE_TMPFILES" /run/tmux-share)" 'alice tmux-share'
+    want 'transcript owner and group for alice' "$(rule_owner "$ALICE_TMPFILES" /run/tmux-share/transcript.log)" 'alice tmux-share'
+    want 'lock owner and group for alice (primary group users)' "$(rule_owner "$ALICE_TMPFILES" /run/tmux-share.lock)" 'alice users'
+    agree 'env TMUX_SHARE_USER' \
+        "$(grep -c "^TMUX_SHARE_USER='alice'$" "$ALICE_MOD_DIR/tmux-share.env" || true)" \
+        "$(grep -c "^TMUX_SHARE_USER='alice'$" "$ALICE_ENV" || true)"
+    want 'env names TMUX_SHARE_USER=alice' "$(grep -c "^TMUX_SHARE_USER='alice'$" "$ALICE_ENV" || true)" 1
+}
+
 CHECKS=(
+    c_user_root
+    c_user_alice
     c_server_exec
     c_server_post
     c_server_restart
@@ -508,10 +607,19 @@ if ! command -v nix >/dev/null 2>&1; then
 else
     resolve_nixpkgs
     if [ -z "$SKIP_ALL" ] && [ -z "$FAIL_ALL" ]; then
-        evaluate_module
+        evaluate_module "$work/module.txt" '{ }'
     fi
     if [ -z "$SKIP_ALL" ] && [ -z "$FAIL_ALL" ]; then
-        load_module
+        load_module "$work/module.txt" "$MOD_DIR"
+    fi
+    if [ -z "$SKIP_ALL" ] && [ -z "$FAIL_ALL" ]; then
+        evaluate_module "$work/module-alice.txt" "$ALICE_EXTRA"
+    fi
+    if [ -z "$SKIP_ALL" ] && [ -z "$FAIL_ALL" ]; then
+        load_module "$work/module-alice.txt" "$ALICE_MOD_DIR"
+    fi
+    if [ -z "$SKIP_ALL" ] && [ -z "$FAIL_ALL" ]; then
+        build_alice_templates
     fi
 fi
 

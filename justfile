@@ -34,7 +34,7 @@ lint:
     echo "lint: $([ "$fail" -eq 0 ] && echo ok || echo failed)"
     exit "$fail"
 
-# Prove the suites can fail: seven deliberate regressions, each restored
+# Prove the suites can fail: twenty-nine deliberate regressions, each restored
 mutate:
     @bash "{{_repo}}/tests/mutation/mutation_test.sh"
 

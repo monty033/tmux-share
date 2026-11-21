@@ -30,7 +30,7 @@ fail() { fail_count=$((fail_count + 1)); printf 'FAIL: %s\n' "$1"; }
 unset TMUX_SHARE_DIR TMUX_SHARE_SESSION TMUX_SHARE_SOCK TMUX_SHARE_LOG \
   TMUX_SHARE_LOCK TMUX_SHARE_NOTREADY_MARKER TMUX_SHARE_REBUILD \
   TMUX_SHARE_STAMP TMUX_SHARE_TMUX TMUX_SHARE_TIMEOUT TMUX_SHARE_MAX_BYTES \
-  TMUX_SHARE_LIBDIR TMUX_SHARE_SHELL || true
+  TMUX_SHARE_LIBDIR TMUX_SHARE_SHELL TMUX_SHARE_USER || true
 
 out=$work/out
 err=$work/err
@@ -145,6 +145,39 @@ if grep -qx 'Environment="TMUX_SHARE_SESSION=tmux-hermes"' "$out"; then pass 'un
 # Each section between markers starts with a "# name" comment and has a body.
 empty=$(awk 'BEGIN{n=0} /^# ---$/ { if (n < 2) print "short section"; n = 0; next } { n++ } END { if (n < 2) print "short section" }' "$out")
 if [ -z "$empty" ]; then pass 'units: no empty section between markers'; else fail 'units: no empty section between markers'; fi
+
+# ---- TMUX_SHARE_USER --------------------------------------------------------
+# Root (set or not) renders exactly what an unset user renders: the account is
+# named in the output only when it is not root.
+run units; cp -- "$out" "$work/units.default"
+run paths; cp -- "$out" "$work/paths.default"
+TMUX_SHARE_USER=root run units
+if cmp -s "$out" "$work/units.default"; then pass 'user: root renders units byte-identical to no user'; else fail 'user: root renders units byte-identical to no user'; fi
+TMUX_SHARE_USER=root run paths
+if cmp -s "$out" "$work/paths.default"; then pass 'user: root renders paths byte-identical to no user'; else fail 'user: root renders paths byte-identical to no user'; fi
+if ! grep -q '^User=' "$work/units.default"; then pass 'user: the default units carry no User= line'; else fail 'user: the default units carry no User= line'; fi
+
+TMUX_SHARE_USER=bob run units
+if [ "$rc" -eq 0 ] && [ "$(grep -cx 'User=bob' "$out")" -eq 3 ]; then
+  pass 'user: a non-root account puts User=bob in all three services'
+else
+  fail "user: a non-root account puts User=bob in all three services (rc=$rc)"
+fi
+if grep -qx 'Environment="TMUX_SHARE_USER=bob"' "$out"; then pass 'user: units carry TMUX_SHARE_USER in the environment'; else fail 'user: units carry TMUX_SHARE_USER in the environment'; fi
+# User= sits inside a [Service] section, never in [Unit] or [Timer].
+misplaced=$(awk '/^\[/ { sec = $0 } /^User=/ && sec != "[Service]" { print sec }' "$out")
+if [ -z "$misplaced" ]; then pass 'user: every User= line is inside [Service]'; else fail "user: User= outside [Service]: $misplaced"; fi
+TMUX_SHARE_USER=bob run paths
+if grep -qx "TMUX_SHARE_USER='bob'" "$out"; then pass 'user: paths defines TMUX_SHARE_USER for a non-root account'; else fail 'user: paths defines TMUX_SHARE_USER for a non-root account'; fi
+
+for bad in 'a;b' 'a b' '-lead' '.lead' 'a$(id)' 'a`id`' 'a/b' "a'b"; do
+  TMUX_SHARE_USER=$bad run units
+  if [ "$rc" -ne 0 ] && [ ! -s "$out" ] && grep -q 'TMUX_SHARE_USER' "$err" && ! grep -qF -- "$bad" "$err"; then
+    pass "user: refuses '$bad' with nothing on stdout and without echoing it"
+  else
+    fail "user: refuses '$bad' (rc=$rc)"
+  fi
+done
 
 # ---- no host probing --------------------------------------------------------
 # paths mode is pure builtins, so it works with an unusable PATH.

@@ -2,12 +2,17 @@
 # install.sh: install tmux-share on a plain-systemd host (no Nix).
 #
 # USAGE
-#   install.sh [--prefix DIR] [--reader GROUP] [--session NAME] [--force] [--dry-run]
+#   install.sh [--prefix DIR] [--reader GROUP] [--session NAME] [--user NAME]
+#              [--force] [--dry-run]
 #   install.sh --help
 #
 # A real install runs as root with the default empty prefix. Without root, pass
 # --prefix DIR: the same layout is written under DIR and nothing outside it is
 # touched. The test suite runs it that way.
+#
+# --user NAME is the account the units run as and that owns the runtime files
+# (default root). It does not make the install rootless: writing
+# /etc/systemd/system still takes root, and so does this script.
 #
 # LAYOUT (relative to the prefix)
 #   usr/local/lib/tmux-share/core/bin/*          core scripts       0755
@@ -15,10 +20,16 @@
 #   usr/local/lib/tmux-share/core/tmux-share-stamp                  0755
 #   usr/local/bin/<script>                       relative symlink into core/bin
 #   etc/systemd/system/*.service, *.timer        units, verbatim    0644
+#                                                (with --user NAME other than root, the
+#                                                services gain User=NAME)
 #   etc/sysusers.d/tmux-share.conf               reader group       0644
 #   etc/tmpfiles.d/tmux-share.conf               runtime rules      0644
-#   etc/tmux-share/tmux.conf                     rendered           0640 root:READER
-#   etc/tmux-share/env                           rendered           0640 root:READER
+#                                                (with --user NAME, owned NAME; the lock
+#                                                group is NAME's primary group)
+#   etc/tmux-share/tmux.conf                     rendered           0640 USER:READER
+#   etc/tmux-share/env                           rendered           0640 USER:READER
+#   USER is root unless --user names another account: the tmux server reads
+#   tmux.conf as that account, and it is not in the reader group.
 #
 # SAFETY
 #   * The preflight probe runs first. If it fails, nothing is written. --force
@@ -34,7 +45,8 @@
 #
 # Exit status: 0 done (or a dry run that would succeed)
 #              1 refused or failed: not root, preflight failed, write error
-#              2 usage or invalid configuration
+#              2 usage or invalid configuration, including a --user that does
+#                not exist on this host or is the reader account
 set -eu
 
 prog=install.sh
@@ -46,7 +58,7 @@ fi
 
 usage() {
     cat <<'EOF'
-usage: install.sh [--prefix DIR] [--reader GROUP] [--session NAME]
+usage: install.sh [--prefix DIR] [--reader GROUP] [--session NAME] [--user NAME]
                   [--force] [--dry-run] [--help]
 
 Install tmux-share on a plain-systemd host. A real install runs as root with
@@ -56,6 +68,9 @@ under DIR.
   --prefix DIR     install under DIR instead of / (default: empty, meaning /)
   --reader GROUP   group that may read the transcript (default: tmux-share)
   --session NAME   tmux session to monitor (default: tmux-hermes)
+  --user NAME      existing account that runs the units and owns the runtime
+                   files (default: root); not the reader account, which is
+                   TMUX_SHARE_READER when that is set. Still needs root to run.
   --force          skip the preflight probe; the install then runs untested
   --dry-run        list every file, destination and mode; change nothing
   --help           show this help
@@ -78,6 +93,7 @@ warn() {
 prefix=''
 reader=tmux-share
 session=''
+user=root
 force=0
 dry=0
 while [ "$#" -gt 0 ]; do
@@ -95,6 +111,11 @@ while [ "$#" -gt 0 ]; do
         --session)
             [ "$#" -ge 2 ] || die "--session needs a name" 2
             session=$2
+            shift 2
+            ;;
+        --user)
+            [ "$#" -ge 2 ] || die "--user needs an account name" 2
+            user=$2
             shift 2
             ;;
         --force)
@@ -134,12 +155,50 @@ esac
 if [ "${#reader}" -gt 32 ]; then
     die "invalid --reader group name: longer than 32 characters" 2
 fi
+# The account is written into unit files and tmpfiles rules, so it gets the
+# alphabet of the module's `user` option before anything is looked up.
+case $user in
+    '' | [!A-Za-z0-9_]* | *[!A-Za-z0-9_.-]*)
+        die "invalid --user account name: $user" 2
+        ;;
+esac
+if [ "${#user}" -gt 32 ]; then
+    die "invalid --user account name: longer than 32 characters" 2
+fi
+# The reader reads the transcript and must never be the operator. Only the
+# reader account the caller names can be compared: the installer has no other
+# way to know it.
+if [ -n "${TMUX_SHARE_READER:-}" ] && [ "$user" = "$TMUX_SHARE_READER" ]; then
+    die "--user $user is the reader account (TMUX_SHARE_READER): the reader gets the transcript and never the socket, so it cannot also run the server" 2
+fi
+# root always exists. Any other account has to, or tmpfiles and systemd would
+# fail at boot on an owner they cannot resolve.
+if [ "$user" != root ] && ! getent passwd "$user" >/dev/null 2>&1; then
+    die "--user $user does not exist on this host; create the account first (this script never creates one)" 2
+fi
+# The lock rule is owned by the account's primary group: it is the group tmux
+# gives the socket and the one that always exists, unlike a group named after
+# the account, which a normal account does not have. Looked up before anything
+# is written so that an account with no resolvable group is refused up front.
+user_group=root
+if [ "$user" != root ]; then
+    user_gid=$(getent passwd "$user" | cut -d: -f4)
+    user_group=$(getent group "$user_gid" 2>/dev/null | cut -d: -f1 || true)
+    case $user_group in
+        '' | [!A-Za-z0-9_]* | *[!A-Za-z0-9_.-]*)
+            die "cannot determine the primary group of --user $user (gid '${user_gid:-none}'): the lock file is owned by it" 2
+            ;;
+    esac
+fi
 if [ -n "$session" ]; then
     if ! validate_session_name "$session"; then
         die "invalid --session: $VALIDATE_REASON" 2
     fi
     export TMUX_SHARE_SESSION=$session
 fi
+# Set unconditionally so a TMUX_SHARE_USER inherited from the caller cannot make
+# the rendered env file disagree with the units and rules written below.
+export TMUX_SHARE_USER=$user
 for v in TMUX_SHARE_LIBDIR TMUX_SHARE_STAMP; do
     if [ -n "${!v:-}" ]; then
         warn "$v is fixed by the install layout; ignoring the value from the environment"
@@ -263,17 +322,55 @@ for f in "$HERE"/core/lib/*; do
     add_file "$f" "$(dest usr/local/lib/tmux-share/core/lib/${f##*/})" 0644 none
 done
 add_file "$HERE/core/tmux-share-stamp" "$stamp_dst" 0755 none
+# The templates run as root. For another account the installed copies are
+# rendered from them; for root they are the templates themselves, byte for byte.
+units_src=$HERE/systemd
+tmpfiles_src=$HERE/systemd/tmux-share.tmpfiles
+if [ "$user" != root ]; then
+    mkdir -p -- "$stage/units"
+    for f in "$HERE"/systemd/*.service; do
+        [ -f "$f" ] || continue
+        # Timers start a unit and take no User=.
+        awk -v u="$user" '
+            { print }
+            /^\[Service\]$/ {
+                print "# User: the account that owns the server and the runtime files (install.sh --user); without it the unit runs as root."
+                print "User=" u
+            }
+        ' "$f" > "$stage/units/${f##*/}"
+        if [ "$(grep -c '^User=' "$stage/units/${f##*/}")" -ne 1 ]; then
+            die "could not add User= to ${f##*/}; nothing was written" 1
+        fi
+    done
+    for f in "$HERE"/systemd/*.timer; do
+        [ -f "$f" ] || continue
+        cp -- "$f" "$stage/units/${f##*/}"
+    done
+    units_src=$stage/units
+    # Owner and group fields of the rules that name root: the directory and the
+    # transcript keep the reader group, the lock's group becomes the user's
+    # primary group.
+    awk -v u="$user" -v g="$user_group" '
+        /^#/ || NF != 7 { print; next }
+        { if ($4 == "root") $4 = u; if ($5 == "root") $5 = g; print }
+    ' "$tmpfiles_src" > "$stage/tmux-share.tmpfiles"
+    if [ "$(grep -c "^[df] .* $user " "$stage/tmux-share.tmpfiles")" -ne 3 ]; then
+        die "could not set the owner in the tmpfiles rules; nothing was written" 1
+    fi
+    tmpfiles_src=$stage/tmux-share.tmpfiles
+fi
 for f in "$HERE"/systemd/*.service "$HERE"/systemd/*.timer; do
     [ -f "$f" ] || continue
-    add_file "$f" "$(dest etc/systemd/system/${f##*/})" 0644 none
+    add_file "$units_src/${f##*/}" "$(dest etc/systemd/system/${f##*/})" 0644 none
 done
 add_file "$HERE/systemd/tmux-share.sysusers" "$(dest etc/sysusers.d/tmux-share.conf)" 0644 none
-add_file "$HERE/systemd/tmux-share.tmpfiles" "$(dest etc/tmpfiles.d/tmux-share.conf)" 0644 none
+add_file "$tmpfiles_src" "$(dest etc/tmpfiles.d/tmux-share.conf)" 0644 none
 add_file "$stage/tmux.conf" "$(dest etc/tmux-share/tmux.conf)" 0640 reader
 add_file "$stage/env" "$(dest etc/tmux-share/env)" 0640 reader
 
 # The group that owns the rendered files. If it does not exist yet (sysusers
-# has not run), they stay root:root and a later run fixes them.
+# has not run), their group stays root and a later run fixes them. Their owner
+# is the --user account, which is root unless named.
 grp=root
 if [ "$uid" -eq 0 ]; then
     if getent group "$reader" >/dev/null 2>&1; then
@@ -290,10 +387,10 @@ sum() {
 
 # classify INDEX: set p_state[INDEX] to create, replace, update, fixup or ok.
 classify() {
-    local i=$1 src dst g=root
+    local i=$1 src dst u=root g=root
     src=${p_src[$i]}
     dst=${p_dst[$i]}
-    if [ "${p_owner[$i]}" = reader ]; then g=$grp; fi
+    if [ "${p_owner[$i]}" = reader ]; then u=$user; g=$grp; fi
     p_state[$i]=ok
     if [ -L "$dst" ]; then
         if [ "${p_kind[$i]}" = link ] && [ "$(readlink -- "$dst")" = "$src" ]; then
@@ -311,7 +408,7 @@ classify() {
         p_state[$i]=update
     elif [ "$(stat -c %a -- "$dst")" != "${p_mode[$i]#0}" ]; then
         p_state[$i]=fixup
-    elif [ "$uid" -eq 0 ] && [ "$(stat -c %U:%G -- "$dst")" != "root:$g" ]; then
+    elif [ "$uid" -eq 0 ] && [ "$(stat -c %U:%G -- "$dst")" != "$u:$g" ]; then
         p_state[$i]=fixup
     fi
     return 0
@@ -326,6 +423,9 @@ describe() {
         detail="mode ${p_mode[$i]}"
         if [ "${p_owner[$i]}" = reader ]; then
             detail="$detail, group $reader"
+            if [ "$user" != root ]; then
+                detail="$detail, owner $user"
+            fi
         fi
     fi
     printf '  %-8s %s  %s\n' "${p_state[$i]}" "${p_dst[$i]}" "$detail"
@@ -344,10 +444,10 @@ backup_aside() {
 
 # apply_one INDEX: make the destination match the plan.
 apply_one() {
-    local i=$1 src dst g=root
+    local i=$1 src dst u=root g=root
     src=${p_src[$i]}
     dst=${p_dst[$i]}
-    if [ "${p_owner[$i]}" = reader ]; then g=$grp; fi
+    if [ "${p_owner[$i]}" = reader ]; then u=$user; g=$grp; fi
     case ${p_state[$i]} in
         ok)
             return 0
@@ -368,7 +468,7 @@ apply_one() {
             ;;
     esac
     if [ "$uid" -eq 0 ] && [ "${p_kind[$i]}" = file ]; then
-        chown -- "root:$g" "$dst"
+        chown -- "$u:$g" "$dst"
     fi
     return 0
 }

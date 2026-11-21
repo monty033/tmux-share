@@ -110,17 +110,57 @@
           };
           c = good.config;
 
+          # The account variants. The module is applied as it is; only the
+          # `user` option and the account declarations differ.
+          withUser = extra: lib.nixosSystem { inherit system; modules = base ++ [ extra ]; };
+          alice = withUser {
+            services.tmux-share.user = "alice";
+            users.users.alice = { isNormalUser = true; home = "/srv/alice"; };
+          };
+          # Not declared in users.users: units for it would fail at boot.
+          carol = withUser { services.tmux-share.user = "carol"; };
+          # An account whose primary group is not named like it, as every normal
+          # NixOS account is ("users"), and one that has a group of its own.
+          erin = withUser {
+            services.tmux-share.user = "erin";
+            users.users.erin = { isNormalUser = true; group = "erin"; };
+            users.groups.erin = { };
+          };
+          # Declared with no home beyond "/", and declared with no primary group.
+          frank = withUser {
+            services.tmux-share.user = "frank";
+            users.users.frank = { isSystemUser = true; group = "users"; home = "/"; };
+          };
+          dave = withUser {
+            services.tmux-share.user = "dave";
+            users.users.dave.isSystemUser = true;
+          };
+          explicitRoot = withUser { services.tmux-share.user = "root"; };
+          badUser = withUser { services.tmux-share.user = "bad;name"; };
+          # examples/default.nix names hermes-reader as the readerUser.
+          sameAsReader = withUser { services.tmux-share.user = "hermes-reader"; };
+          # The module as it was before the `user` option, frozen in
+          # tests/nix/base-module.nix. A default configuration has to render the
+          # same text with this one, so a host that never sets `user` is unchanged.
+          baseSystem = lib.nixosSystem {
+            inherit system;
+            modules = [ (import ./tests/nix/base-module.nix { inherit self; }) ] ++ builtins.tail base;
+          };
+
           # The text of each rendered file. Discarding the string context keeps
           # this check from building the packages the units point at: it reads
           # text, it does not run anything.
-          unit = name: builtins.unsafeDiscardStringContext c.systemd.units.${name}.text;
+          unitOf = cfg: name: builtins.unsafeDiscardStringContext cfg.systemd.units.${name}.text;
+          tmpfilesOf = cfg: builtins.unsafeDiscardStringContext (lib.concatStringsSep "\n" cfg.systemd.tmpfiles.rules);
+          etcOf = cfg: name: builtins.unsafeDiscardStringContext cfg.environment.etc.${name}.text;
+          unit = unitOf c;
           file = name: body: pkgs.writeText name (builtins.unsafeDiscardStringContext body);
           server = file "tmux-share-server.service" (unit "tmux-share-server.service");
           tap = file "tmux-share-tap.service" (unit "tmux-share-tap.service");
           tapTimer = file "tmux-share-tap.timer" (unit "tmux-share-tap.timer");
           trim = file "tmux-share-trim.service" (unit "tmux-share-trim.service");
           trimTimer = file "tmux-share-trim.timer" (unit "tmux-share-trim.timer");
-          tmpfiles = file "tmux-share.tmpfiles" (lib.concatStringsSep "\n" c.systemd.tmpfiles.rules);
+          tmpfiles = file "tmux-share.tmpfiles" (tmpfilesOf c);
           tmuxConf = file "tmux-share.conf" (c.environment.etc."tmux-share/tmux.conf".text);
           envFile = file "tmux-share.env" (c.environment.etc."tmux-share/env".text);
 
@@ -128,6 +168,52 @@
           rejectsSession = builtins.any
             (a: !a.assertion && lib.hasInfix "sessionName" a.message)
             badSession.config.assertions;
+          rejects = what: sys: builtins.any
+            (a: !a.assertion && lib.hasInfix what a.message)
+            sys.config.assertions;
+          holds = sys: builtins.all (a: a.assertion) sys.config.assertions;
+
+          # Store hashes differ between the two package builds, and nothing else
+          # may: each "/nix/store/<hash>-" is replaced by a fixed one.
+          norm = text: lib.concatStrings (map
+            (part: if builtins.isList part then "/nix/store/HASH-" else part)
+            (builtins.split "/nix/store/[a-z0-9]{32}-" text));
+          sameText = a: b: norm a == norm b;
+          sameAsBase = other: name: sameText (unitOf other.config name) (unitOf baseSystem.config name);
+          unitNames = [
+            "tmux-share-server.service"
+            "tmux-share-tap.service"
+            "tmux-share-tap.timer"
+            "tmux-share-trim.service"
+            "tmux-share-trim.timer"
+          ];
+          # Every rendered file the option could reach, as one comparison.
+          renderedSameAsBase = other:
+            builtins.all (sameAsBase other) unitNames
+            && sameText (tmpfilesOf other.config) (tmpfilesOf baseSystem.config)
+            && sameText (etcOf other.config "tmux-share/tmux.conf") (etcOf baseSystem.config "tmux-share/tmux.conf")
+            && sameText (etcOf other.config "tmux-share/env") (etcOf baseSystem.config "tmux-share/env")
+            # Owner, group and mode of the two files are part of what "unchanged" means.
+            && etcSameAsBase other "tmux-share/tmux.conf"
+            && etcSameAsBase other "tmux-share/env";
+
+          aliceFile = name: body: file "alice-${name}" body;
+          aliceServer = aliceFile "server" (unitOf alice.config "tmux-share-server.service");
+          aliceTap = aliceFile "tap" (unitOf alice.config "tmux-share-tap.service");
+          aliceTrim = aliceFile "trim" (unitOf alice.config "tmux-share-trim.service");
+          aliceTapTimer = aliceFile "tap-timer" (unitOf alice.config "tmux-share-tap.timer");
+          aliceTrimTimer = aliceFile "trim-timer" (unitOf alice.config "tmux-share-trim.timer");
+          aliceTmpfiles = aliceFile "tmpfiles" (tmpfilesOf alice.config);
+          aliceConf = aliceFile "conf" (etcOf alice.config "tmux-share/tmux.conf");
+          aliceEnv = aliceFile "env" (etcOf alice.config "tmux-share/env");
+          frankConf = file "frank-conf" (etcOf frank.config "tmux-share/tmux.conf");
+          erinTmpfiles = file "erin-tmpfiles" (tmpfilesOf erin.config);
+          # How the two rendered files are owned: only the account differs.
+          etcAttrs = cfg: name: {
+            inherit (cfg.environment.etc.${name}) mode user group;
+          };
+          etcSameAsBase = other: name: etcAttrs other.config name == etcAttrs baseSystem.config name;
+          aliceEtc = name: etcAttrs alice.config name;
         in
         pkgs.runCommand "tmux-share-module-renders" { } ''
           fails=0
@@ -198,6 +284,57 @@
           # ---- the env file the units read ----
           assert_that env-session grep -qx "TMUX_SHARE_SESSION='tmux-hermes'" ${envFile}
           assert_that env-max-bytes grep -qx "TMUX_SHARE_MAX_BYTES='2097152'" ${envFile}
+
+          # ---- the user option: root stays the default ----
+          # The rendered text with no `user` set, and with "root" set on purpose,
+          # equals the text of the module before the option existed.
+          assert_that user-default-render-identical-to-base ${lib.boolToString (renderedSameAsBase good)}
+          assert_that user-root-render-identical-to-base ${lib.boolToString (renderedSameAsBase explicitRoot)}
+          # TRAP: a User=root line would be harmless to systemd and still change
+          # the text, so the default must declare no User= at all.
+          refute_that user-default-declares-no-user grep -q 'User=' ${server} ${tap} ${trim}
+
+          # ---- the user option: a non-root account ----
+          assert_that user-alice-assertions-hold ${lib.boolToString (holds alice)}
+          assert_that user-alice-env grep -qx "TMUX_SHARE_USER='alice'" ${aliceEnv}
+          assert_that user-alice-tmpfiles-dir grep -qx 'd /run/tmux-share 0710 alice tmux-share - -' ${aliceTmpfiles}
+          assert_that user-alice-tmpfiles-transcript grep -qx 'f /run/tmux-share/transcript.log 0640 alice tmux-share - -' ${aliceTmpfiles}
+          # The lock's group is the primary group NixOS gives the account ("users"
+          # for a normal user), not a group named after it: that one does not
+          # exist, and systemd-tmpfiles fails the rule at boot when it does not.
+          assert_that user-alice-primary-group-is-users ${lib.boolToString (alice.config.users.users.alice.group == "users")}
+          assert_that user-alice-tmpfiles-lock grep -qx 'f /run/tmux-share.lock 0600 alice users - -' ${aliceTmpfiles}
+          refute_that user-alice-lock-group-not-named-after-the-account grep -q 'alice alice' ${aliceTmpfiles}
+          assert_that user-own-group-tmpfiles-lock grep -qx 'f /run/tmux-share.lock 0600 erin erin - -' ${erinTmpfiles}
+          # The two rendered files belong to the account the server runs as, with
+          # group read for the reader group, as install.sh makes them.
+          assert_that user-alice-etc-conf-owned ${lib.boolToString (aliceEtc "tmux-share/tmux.conf" == { mode = "0640"; user = "alice"; group = "tmux-share"; })}
+          assert_that user-alice-etc-env-owned ${lib.boolToString (aliceEtc "tmux-share/env" == { mode = "0640"; user = "alice"; group = "tmux-share"; })}
+          # The reader group never owns anything and never gains write: no
+          # tmux-share rule may name root once the owner is alice.
+          refute_that user-alice-tmpfiles-no-root grep -E '^[df] /run/tmux-share.* root ' ${aliceTmpfiles}
+          assert_that user-alice-server-runs-as grep -qx 'User=alice' ${aliceServer}
+          assert_that user-alice-tap-runs-as grep -qx 'User=alice' ${aliceTap}
+          assert_that user-alice-trim-runs-as grep -qx 'User=alice' ${aliceTrim}
+          # Timers do not run anything themselves; a User= there is not valid.
+          refute_that user-alice-timers-no-user grep -q 'User=' ${aliceTapTimer} ${aliceTrimTimer}
+          # The two traps stay: a non-root owner must not bring UMask or
+          # RuntimeDirectory back in.
+          refute_that user-alice-no-umask-no-runtimedirectory grep -qiE 'UMask|RuntimeDirectory' ${aliceServer} ${aliceTap} ${aliceTrim}
+          assert_that user-alice-session-in-the-account-home grep -qx 'new-session -d -s tmux-hermes -c /srv/alice' ${aliceConf}
+          refute_that user-alice-session-not-in-root grep -q '/root' ${aliceConf}
+          assert_that user-home-slash-session-in-slash grep -qx 'new-session -d -s tmux-hermes -c /' ${frankConf}
+          # The comment says what the -c is: no home for "/", the home otherwise.
+          assert_that user-comment-names-the-slash grep -q '^# .*-c /: frank has no home other than /' ${frankConf}
+          assert_that user-comment-names-the-home grep -q '^# .*-c /srv/alice: the shell starts in the home of alice' ${aliceConf}
+
+          # ---- the user option: refused values ----
+          assert_that user-semicolon-rejected ${lib.boolToString (rejects "services.tmux-share.user must be a plain account name" badUser)}
+          assert_that user-undeclared-rejected ${lib.boolToString (rejects "must be root or an account declared in users.users" carol)}
+          assert_that user-undeclared-explains-boot-failure ${lib.boolToString (rejects "fail at boot" carol)}
+          assert_that user-without-primary-group-rejected ${lib.boolToString (rejects "primary group of services.tmux-share.user cannot be determined" dave)}
+          assert_that user-alice-not-rejected-as-undeclared ${lib.boolToString (!(rejects "must be root or an account declared" alice))}
+          assert_that user-equal-to-reader-rejected ${lib.boolToString (rejects "must not be the readerUser" sameAsReader)}
 
           if [ "$fails" -ne 0 ]; then
             echo "module-renders: $fails assertion(s) failed" >&2

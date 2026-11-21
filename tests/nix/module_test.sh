@@ -43,6 +43,36 @@ tmux-conf-default-shell
 tmux-conf-no-other-settings
 env-session
 env-max-bytes
+user-default-render-identical-to-base
+user-root-render-identical-to-base
+user-default-declares-no-user
+user-alice-assertions-hold
+user-alice-env
+user-alice-tmpfiles-dir
+user-alice-tmpfiles-transcript
+user-alice-primary-group-is-users
+user-alice-tmpfiles-lock
+user-alice-lock-group-not-named-after-the-account
+user-own-group-tmpfiles-lock
+user-alice-etc-conf-owned
+user-alice-etc-env-owned
+user-alice-tmpfiles-no-root
+user-alice-server-runs-as
+user-alice-tap-runs-as
+user-alice-trim-runs-as
+user-alice-timers-no-user
+user-alice-no-umask-no-runtimedirectory
+user-alice-session-in-the-account-home
+user-alice-session-not-in-root
+user-home-slash-session-in-slash
+user-comment-names-the-slash
+user-comment-names-the-home
+user-semicolon-rejected
+user-undeclared-rejected
+user-undeclared-explains-boot-failure
+user-without-primary-group-rejected
+user-alice-not-rejected-as-undeclared
+user-equal-to-reader-rejected
 '
 
 if ! command -v nix >/dev/null 2>&1; then

@@ -4,7 +4,7 @@ This document states the boundary tmux-share implements and, just as importantly
 
 ## The boundary
 
-The tmux server socket lives in the root-owned runtime directory, is created by tmux itself with mode 0600 and is owned root:root. Only root can connect to it. The operator attaches as root through `tmux-share-attach`, which builds one fixed, validated `tmux -S` / `attach -t` command line; extra arguments are appended after the session. The reader account is never given this command and never gets a file descriptor for the socket — it can only open the transcript.
+The tmux server socket lives in the runtime directory owned by the service account (root unless a `user` is configured; the rest of this page says root), is created by tmux itself with mode 0600 and is owned by that account. Only it, and root, can connect to it. The operator attaches as that account or root through `tmux-share-attach`, which builds one fixed, validated `tmux -S` / `attach -t` command line; extra arguments are appended after the session. The reader account is never given this command and never gets a file descriptor for the socket — it can only open the transcript.
 
 tmux's own read-only client mode is **not** a boundary. The attach wrapper happily passes `-r` through to tmux, but a read-only client only restricts what the *client* may type; key bindings that call `run-shell` or `if-shell` still execute as the tmux server owner, which here is root. Handing a reader a client, even a read-only one, would hand it root's shell through tmux's configuration. The boundary is the kernel's permission check on the socket, not a tmux option.
 
@@ -67,7 +67,7 @@ The shell the operator gets inside the session is the server's: `default-shell` 
 
 ## Assumptions about root and sudo
 
-The boundary assumes root is uncompromised. Every tmux-share component — server, tap-start, watchdog, trimmer — runs as root, because it records what a root shell does and manages root-owned runtime files; there is no unprivileged service account. It also assumes the host's sudo policy gives the reader nothing useful: no ability to read the socket, run `tmux-share-attach`, alter the group, or become root. If a reader can do any of those, the separation this design provides is void.
+The boundary assumes root is uncompromised. Every tmux-share component — server, tap-start, watchdog, trimmer — runs as one account: root by default, or the single existing account named by `services.tmux-share.user` or `install.sh --user`. It records what that account's shell does and manages its runtime files. Choosing another account does not change the model: the reader still gets the transcript and never the socket, that account can drive the shell, and it must not be the reader. The account is an operator, not a sandbox: nothing here makes the service rootless. It also assumes the host's sudo policy gives the reader nothing useful: no ability to read the socket, run `tmux-share-attach`, alter the group, or become root. If a reader can do any of those, the separation this design provides is void.
 
 ## The toggle trap
 

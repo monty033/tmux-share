@@ -210,6 +210,107 @@ mutate_case 'watchdog: list-panes loses its timeout wrapper' \
 mutate_case 'verify: execute bit removed' \
     tests/unit/modes_test.sh core/bin/tmux-share-verify drop_exec_bit
 
+# ---- any-user: the guards that keep a non-root account from being root in disguise
+# Each one is a way the `user` option could silently stop doing its job.
+
+mutate_case 'module: User=root emitted for the default account' \
+    tests/nix/module_test.sh nix/module.nix edit_file \
+    'runAs = optionalAttrs (cfg.user != "root") { User = cfg.user; };' \
+    'runAs = { User = cfg.user; };'
+
+mutate_case 'module: lock group is named after the account, not its primary group' \
+    tests/nix/module_test.sh nix/module.nix edit_file \
+    '"f ${lock} 0600 ${cfg.user} ${userGroup} - -"' \
+    '"f ${lock} 0600 ${cfg.user} ${cfg.user} - -"'
+
+mutate_case 'module: an account not declared in users.users is accepted' \
+    tests/nix/module_test.sh nix/module.nix edit_file \
+    'assertion = cfg.user == "root" || builtins.hasAttr cfg.user config.users.users;' \
+    'assertion = true;'
+
+mutate_case 'module: an account with no primary group is accepted' \
+    tests/nix/module_test.sh nix/module.nix edit_file \
+    'assertion = userGroup != "";' 'assertion = true;'
+
+mutate_case 'module: user equal to readerUser accepted' \
+    tests/nix/module_test.sh nix/module.nix edit_file \
+    'assertion = cfg.readerUser == null || cfg.user != cfg.readerUser;' \
+    'assertion = true;'
+
+mutate_case 'module: transcript stays root-owned for another account' \
+    tests/parity/parity_test.sh nix/module.nix edit_file \
+    '"f ${transcript} 0640 ${cfg.user} ${cfg.readerGroup} - -"' \
+    '"f ${transcript} 0640 root ${cfg.readerGroup} - -"'
+
+mutate_case 'attach: the gate is removed' \
+    tests/unit/attach_test.sh core/bin/tmux-share-attach edit_file \
+    'if [ "$check" -eq 0 ] && [ "$EUID" -ne 0 ]; then' 'if false; then'
+
+mutate_case 'attach: the gate reads TMUX_SHARE_DIR, which a caller can set' \
+    tests/unit/attach_test.sh core/bin/tmux-share-attach edit_file \
+    'rundir=${TMUX_SHARE_SOCK%/*}' 'rundir=${TMUX_SHARE_DIR:-${TMUX_SHARE_SOCK%/*}}'
+
+mutate_case 'attach: the gate asks id on PATH instead of the kernel' \
+    tests/unit/attach_test.sh core/bin/tmux-share-attach edit_file \
+    '[ -O "$rundir" ]' '[ "$(id -u)" = "$(stat -c %u -- "$rundir")" ]'
+
+mutate_case 'verify: expected owner is root whatever the user' \
+    tests/unit/verify_test.sh core/bin/tmux-share-verify edit_file \
+    '    SOCK_OWNER=$USER_NAME:$(id -gn' '    SOCK_OWNER=root:root; : $(id -gn'
+
+mutate_case 'verify: the lock is judged against a group named like the account' \
+    tests/unit/verify_test.sh core/bin/tmux-share-verify edit_file \
+    '    OWNER=$SOCK_OWNER' '    OWNER=$USER_NAME:$USER_NAME'
+
+mutate_case 'verify: the directory owner check ignores the user' \
+    tests/unit/verify_test.sh core/bin/tmux-share-verify edit_file \
+    'check_owner "$DIR" "$OWNER_USER:$GROUP"' 'check_owner "$DIR" "root:$GROUP"'
+
+mutate_case 'render: TMUX_SHARE_USER is not validated' \
+    tests/unit/render_test.sh core/bin/tmux-share-render edit_file \
+    '[!"$_VALIDATE_ALNUM"_]* | *[!"$_VALIDATE_ALNUM"_.-]*)' "'')"
+
+mutate_case 'selftest: the scratch tree is judged against root' \
+    tests/unit/selftest_test.sh core/bin/tmux-share-selftest edit_file \
+    'OWNER=$(id -un):$GROUP' 'OWNER=root:$GROUP'
+
+mutate_case 'install: an unknown --user account is accepted' \
+    tests/install/install_test.sh install.sh edit_file \
+    'if [ "$user" != root ] && ! getent passwd "$user" >/dev/null 2>&1; then' 'if false; then'
+
+mutate_case 'install: --user equal to the reader account is accepted' \
+    tests/install/install_test.sh install.sh edit_file \
+    'if [ -n "${TMUX_SHARE_READER:-}" ] && [ "$user" = "$TMUX_SHARE_READER" ]; then' 'if false; then'
+
+mutate_case 'install: --user name is not checked for characters' \
+    tests/install/install_test.sh install.sh edit_file \
+    "'' | [!A-Za-z0-9_]* | *[!A-Za-z0-9_.-]*)
+        die \"invalid --user" "'')
+        die \"invalid --user"
+
+mutate_case 'install: the lock rule keeps group root' \
+    tests/install/install_test.sh install.sh edit_file \
+    'if ($5 == "root") $5 = g;' ''
+
+mutate_case 'install: an unresolvable primary group is accepted' \
+    tests/install/install_test.sh install.sh edit_file \
+    "        '' | [!A-Za-z0-9_]* | *[!A-Za-z0-9_.-]*)
+            die \"cannot determine" \
+    "        zzz)
+            die \"cannot determine"
+
+mutate_case 'install: the lock group is named after the account'  \
+    tests/install/install_test.sh install.sh edit_file \
+    'awk -v u="$user" -v g="$user_group"' 'awk -v u="$user" -v g="$user"'
+
+mutate_case 'install: services get User=root whatever --user says' \
+    tests/install/install_test.sh install.sh edit_file \
+    'print "User=" u' 'print "User=root"'
+
+mutate_case 'install: an inherited TMUX_SHARE_USER reaches the env file' \
+    tests/install/install_test.sh install.sh edit_file \
+    'export TMUX_SHARE_USER=$user' ':'
+
 check_summary
 summary=$?
 

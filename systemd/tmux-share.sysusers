@@ -18,12 +18,13 @@
 # To revoke access: `gpasswd -d <reader> tmux-share`.
 #
 # NO SERVICE ACCOUNT IS DECLARED, deliberately. Every tmux-share component (the
-# tmux server, the transcript tap, the watchdog, the trimmer) runs as root,
-# because the transcript is a record of what the root shell does and the
-# runtime files are root-owned. A dedicated user would only matter if some
-# component ran unprivileged, and none does. Declaring an unused user would
-# add an account to the host for no benefit; add one here only together with a
-# component that actually runs as it.
+# tmux server, the transcript tap, the watchdog, the trimmer) runs as one
+# account: root by default, or the existing account that `install.sh --user`
+# names. The transcript is a record of what that account's shell does and the
+# runtime files belong to it. This file never creates that account, and it
+# never needs to: a dedicated service user would only matter if components ran
+# under different accounts, and none does. Declaring an unused user would add
+# an account to the host for no benefit.
 #
 # Type  Name        ID
 # "-" lets the system pick a free GID (a system-range GID, as for any

@@ -15,27 +15,32 @@
 # on every rule.
 #
 # THE SOCKET HAS NO RULE HERE, ON PURPOSE. tmux creates its socket itself,
-# owner-only (mode 0600, root), and connecting to a unix socket needs write
+# owner-only (mode 0600, the service account), and connecting to a unix socket needs write
 # permission on it, so that is the boundary that keeps the reader group from
 # driving the shell even though it can traverse the directory the socket is in.
 # A tmpfiles rule that pre-created the socket path would have to pick a mode,
 # and any mode wider than tmux's own would undo that boundary before tmux ever
 # ran. Leaving the path alone means the only thing that can ever make the
 # socket is the process that owns it, with its own restrictive mode. The same reasoning covers the other runtime markers
-# (.notready-since, .rebuild-required): the scripts create them, root-owned.
+# (.notready-since, .rebuild-required): the scripts create them, owned by the service account.
 
+# OWNER. "root" in the rules below is the service account, which is root unless
+# install.sh --user NAME renders this file with NAME in its place (the lock's
+# group becomes NAME's primary group). The NixOS module generates its own rules
+# from services.tmux-share.user and is kept in step by tests/parity.
+#
 # The runtime directory: 0710 root:tmux-share. Group "x" without "r" means a
 # member of tmux-share can open a path it already knows inside the directory
 # (the transcript) but cannot list the directory, so it cannot enumerate what
 # else is there. Other: no access at all.
 d /run/tmux-share 0710 root tmux-share - -
 
-# The transcript, the reader's contract: 0640 root:tmux-share. Root writes it;
+# The transcript, the reader's contract: 0640 root:tmux-share. The owner writes it;
 # the group may read it and nothing more (no group write, so the reader cannot
 # alter or truncate the record).
 f /run/tmux-share/transcript.log 0640 root tmux-share - -
 
-# The advisory lock: 0600 root:root, and deliberately NOT group-readable.
+# The advisory lock: 0600 root:root (user:user for another account), and deliberately NOT group-readable.
 # flock(2) needs only read access to the file, so a lock the reader could open
 # is a lock the reader could hold, stalling the taps and the trimmer that wait
 # on it. It lives outside the runtime directory, in /run itself, so it is not

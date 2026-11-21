@@ -28,6 +28,21 @@ It checks that `pipe-pane` attaches and detaches, that `#{pane_pipe}` reports st
 
 A real install requires root and an empty prefix; the script refuses otherwise.
 
+## Running as an account other than root
+
+By default every component runs as root. `--user NAME` makes the units run as an existing account and makes that account own the runtime files:
+
+```sh example
+sudo ./install.sh --user <operator>
+```
+
+- The install itself still needs root: it writes `/etc/systemd/system`. `--user root` is the default and changes nothing.
+- The account must exist (`getent passwd`); the script never creates one and exits 2 when it is missing. It also exits 2 when the name is the reader account. The installer can only recognise the reader account through `TMUX_SHARE_READER`, so export it with the reader's name when you run the installer: the reader gets the transcript and never the socket, so it cannot also run the server.
+- `tmux-share-server.service`, `tmux-share-tap.service` and `tmux-share-trim.service` gain `User=NAME`. The tmpfiles rules own the directory and transcript `NAME:READER-GROUP` and the lock `NAME:<primary group of NAME>`, looked up with `getent`. A group named like the account is not needed; the installer exits 2 if the primary group cannot be resolved.
+- `/etc/tmux-share/tmux.conf` and `/etc/tmux-share/env` are mode 0640 and owned `NAME:READER-GROUP`. `NAME` owns them because the tmux server runs as `NAME` and has to read them, and the reader group can read them too. (The NixOS module writes the same ownership for a non-root `user`; for root it keeps its older root:root 0644, so the two paths differ there.)
+- The session starts in the unit's working directory (`/`), not in a home directory.
+- `tmux-share-attach` is meant for `NAME` and root, and tells anyone else so. That is a courtesy; the socket's mode and the runtime directory's ownership are what keep other accounts out (see `operations.md`). For verification, run `TMUX_SHARE_USER=NAME tmux-share-verify` after sourcing `/etc/tmux-share/env`, which already names it.
+
 ## 3. The real install
 
 ```sh
@@ -50,7 +65,7 @@ sudo systemctl enable --now tmux-share-server.service
 sudo systemctl enable --now tmux-share-tap.timer tmux-share-trim.timer
 ```
 
-At the instant `install.sh` runs, the reader group may not exist yet, so it leaves `/etc/tmux-share/env` and `/etc/tmux-share/tmux.conf` owned root:root. After `systemd-sysusers` has created the group, re-run the installer to fix that ownership:
+At the instant `install.sh` runs, the reader group may not exist yet, so it leaves `/etc/tmux-share/env` and `/etc/tmux-share/tmux.conf` with the root group (owned by `--user`, root by default). After `systemd-sysusers` has created the group, re-run the installer to fix that ownership:
 
 ```sh
 sudo ./install.sh

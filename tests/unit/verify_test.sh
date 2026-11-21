@@ -209,6 +209,98 @@ case $out in
     *) bad 'an uninstalled tree reports skips' ;;
 esac
 
+# ---------------------------------------------------------------- case 9
+# The expected owner follows TMUX_SHARE_USER, not the literal root. These cases
+# leave TMUX_SHARE_VERIFY_OWNER unset: it overrides the derivation, so it would
+# hide the very thing under test.
+run_user() {
+    local t=$1 user=$2
+    env -u TMUX_SHARE_VERIFY_OWNER \
+        TMUX_SHARE_USER="$user" \
+        TMUX_SHARE_DIR="$t/deploy" \
+        TMUX_SHARE_SOCK="$t/deploy/tmux.sock" \
+        TMUX_SHARE_LOG="$t/deploy/transcript.log" \
+        TMUX_SHARE_LOCK="$t/lock" \
+        TMUX_SHARE_STAMP="$t/stamp" \
+        TMUX_SHARE_LIBDIR="$CORE/core/lib" \
+        TMUX_SHARE_GROUP="$ME_GROUP" \
+        TMUX_SHARE_BINDIR="$t/bin" \
+        TMUX_SHARE_UNITDIR="$t/units" \
+        bash "$VERIFY" 2>&1
+}
+
+T9=$TMP/owneruser; build_good_tree "$T9"
+make_socket "$T9/deploy/tmux.sock" 600 >/dev/null 2>&1 || true
+rc=0; out=$(run_user "$T9" "$ME_USER") || rc=$?
+# A normal NixOS account has primary group "users", not a group named like it.
+# The lock and the socket are therefore judged against the account's primary
+# group: all four owner checks must pass for a tree owned by that pair. When the
+# account's group happens to carry its own name the case proves nothing about
+# that, so it is skipped rather than passed.
+if [ "$ME_USER" = "$ME_GROUP" ]; then
+    skp 'primary-group case needs an account whose primary group is not named like it'
+else
+    for chk in deploy-dir-traversable-not-listable transcript-mode-owner socket-owner-only lock-mode-owner; do
+        if printf '%s\n' "$out" | grep -q "^PASS $chk\$"; then
+            ok "an account whose primary group is not named like it passes $chk"
+        else
+            bad "an account whose primary group is not named like it passes $chk"
+        fi
+    done
+    # The lock owned by a same-named group is the wrong group here, and it has to
+    # be said so: the check must not accept user:user for such an account.
+    if printf '%s\n' "$out" | grep -q "expected $ME_USER:$ME_USER"; then
+        bad 'the expected lock group is the primary group, not a group named like the account'
+    else
+        ok 'the expected lock group is the primary group, not a group named like the account'
+    fi
+fi
+
+# ---------------------------------------------------------------- case 10
+# A tree owned by someone else is a failure for a non-root expected owner, in
+# every owner check. This is the case a verifier that still said "root" would
+# get wrong in the other direction: it would pass a root-owned tree for bob.
+T10=$TMP/wrongowner; build_good_tree "$T10"
+make_socket "$T10/deploy/tmux.sock" 600 >/dev/null 2>&1 || true
+rc=0; out=$(run_user "$T10" notme) || rc=$?
+if [ "$rc" -ne 0 ]; then ok 'a tree not owned by the configured non-root user fails the run'; else bad 'a tree not owned by the configured non-root user fails the run'; fi
+for chk in deploy-dir-traversable-not-listable transcript-mode-owner socket-owner-only lock-mode-owner; do
+    if printf '%s\n' "$out" | grep -q "^FAIL $chk: owner of .* expected notme:"; then
+        ok "wrong non-root owner: $chk fails and names the expected owner"
+    else
+        bad "wrong non-root owner: $chk fails and names the expected owner"
+    fi
+done
+
+# ---------------------------------------------------------------- case 11
+# With no TMUX_SHARE_USER the expectation is still root, so a tree owned by an
+# ordinary account fails (skipped when the test itself runs as root).
+if [ "$(id -u)" -ne 0 ]; then
+    rc=0
+    out=$(env -u TMUX_SHARE_USER -u TMUX_SHARE_VERIFY_OWNER \
+        TMUX_SHARE_DIR="$T10/deploy" TMUX_SHARE_SOCK="$T10/deploy/tmux.sock" \
+        TMUX_SHARE_LOG="$T10/deploy/transcript.log" TMUX_SHARE_LOCK="$T10/lock" \
+        TMUX_SHARE_STAMP="$T10/stamp" TMUX_SHARE_LIBDIR="$CORE/core/lib" \
+        TMUX_SHARE_GROUP="$ME_GROUP" TMUX_SHARE_BINDIR="$T10/bin" \
+        TMUX_SHARE_UNITDIR="$T10/units" bash "$VERIFY" 2>&1) || rc=$?
+    if [ "$rc" -ne 0 ] && printf '%s\n' "$out" | grep -q 'expected root:root'; then
+        ok 'with no user configured the expected owner is still root'
+    else
+        bad 'with no user configured the expected owner is still root'
+    fi
+else
+    skp 'default-owner-is-root case (test is running as root)'
+fi
+
+# ---------------------------------------------------------------- case 12
+# TMUX_SHARE_USER is checked like every other account name.
+rc=0; out=$(run_user "$T10" 'bad;name') || rc=$?
+if [ "$rc" -ne 0 ] && printf '%s\n' "$out" | grep -q 'TMUX_SHARE_USER rejected'; then
+    ok 'a hostile TMUX_SHARE_USER is rejected before any check runs'
+else
+    bad 'a hostile TMUX_SHARE_USER is rejected before any check runs'
+fi
+
 # ---------------------------------------------------------------- summary
 printf '\nRESULT: %d passed, %d failed, %d skipped\n' "$pass" "$fail" "$skip"
 [ "$fail" -eq 0 ] || exit 1

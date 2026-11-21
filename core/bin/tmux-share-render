@@ -37,6 +37,9 @@
 #   TMUX_SHARE_TIMEOUT=timeout            TMUX_SHARE_MAX_BYTES=2097152
 #   TMUX_SHARE_LIBDIR=<core>/lib
 #   TMUX_SHARE_SHELL   optional; the operator's shell inside the session
+#   TMUX_SHARE_USER=root   the account the units run as and that owns the
+#                          runtime files; named in the output only when it is
+#                          not root, so a root deployment renders as before
 set -eu
 
 prog=tmux-share-render
@@ -116,6 +119,7 @@ core=${abs%/*}
 : "${TMUX_SHARE_TIMEOUT:=timeout}"
 : "${TMUX_SHARE_MAX_BYTES:=2097152}"
 TMUX_SHARE_SHELL=${TMUX_SHARE_SHELL:-}
+TMUX_SHARE_USER=${TMUX_SHARE_USER:-root}
 bindir=$abs
 
 # ---- validate everything before printing anything ---------------------------
@@ -152,6 +156,13 @@ fi
 if ! validate_session_name "$TMUX_SHARE_SESSION"; then
     die "TMUX_SHARE_SESSION rejected: $VALIDATE_REASON"
 fi
+# The account is written into a unit file (User=) and an EnvironmentFile line,
+# so it gets the alphabet of the module's `user` option and nothing else.
+case $TMUX_SHARE_USER in
+    [!"$_VALIDATE_ALNUM"_]* | *[!"$_VALIDATE_ALNUM"_.-]*)
+        die "TMUX_SHARE_USER rejected: not a plain account name"
+        ;;
+esac
 check_command TMUX_SHARE_TMUX
 check_command TMUX_SHARE_TIMEOUT
 case $TMUX_SHARE_MAX_BYTES in
@@ -173,6 +184,9 @@ keys=(TMUX_SHARE_DIR TMUX_SHARE_SESSION TMUX_SHARE_SOCK TMUX_SHARE_LOG
     TMUX_SHARE_LOCK TMUX_SHARE_NOTREADY_MARKER TMUX_SHARE_REBUILD
     TMUX_SHARE_STAMP TMUX_SHARE_TMUX TMUX_SHARE_TIMEOUT TMUX_SHARE_MAX_BYTES
     TMUX_SHARE_LIBDIR)
+if [ "$TMUX_SHARE_USER" != root ]; then
+    keys+=(TMUX_SHARE_USER)
+fi
 
 # ---- renderers --------------------------------------------------------------
 render_tmux_config() {
@@ -212,6 +226,18 @@ env_lines() {
     done
 }
 
+# service_user: the User= line of a [Service] section, for an account other
+# than root. systemd runs a unit as root when it is absent, so root adds
+# nothing and renders exactly as before. The leading newline is deliberate: the
+# caller places the output right after env_lines. install.sh does not call this:
+# it patches the unit templates itself, and tests/parity is what keeps the two
+# in agreement.
+service_user() {
+    if [ "$TMUX_SHARE_USER" != root ]; then
+        printf '\nUser=%s' "$TMUX_SHARE_USER"
+    fi
+}
+
 render_units() {
     cat <<EOF
 # tmux-share.service
@@ -221,7 +247,7 @@ After=local-fs.target
 
 [Service]
 Type=simple
-$(env_lines)
+$(env_lines)$(service_user)
 # Install the tmux-config output at the -f path below.
 # -D keeps the server in the foreground so systemd tracks it directly.
 ExecStart=$TMUX_SHARE_TMUX -D -S $TMUX_SHARE_SOCK -f /etc/tmux-share/tmux.conf
@@ -240,7 +266,7 @@ After=tmux-share.service
 
 [Service]
 Type=oneshot
-$(env_lines)
+$(env_lines)$(service_user)
 ExecStart=$bindir/tmux-share-watchdog
 # ---
 # tmux-share-watchdog.timer
@@ -261,7 +287,7 @@ After=tmux-share.service
 
 [Service]
 Type=oneshot
-$(env_lines)
+$(env_lines)$(service_user)
 ExecStart=$bindir/tmux-share-trim
 # ---
 # tmux-share-trim.timer

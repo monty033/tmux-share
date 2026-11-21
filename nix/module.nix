@@ -48,6 +48,44 @@ let
   tmuxConf = "/etc/tmux-share/tmux.conf";
   envFile = "/etc/tmux-share/env";
 
+  # The primary group of `user`, read from the account's declaration. The lock
+  # is owned by that group because that is the group tmux and the scripts give
+  # every file the account creates, so the lock agrees with the socket and with
+  # what tmux-share-verify checks. A group named after the account would not
+  # exist on a normal NixOS account, whose primary group is "users". Empty when
+  # the declaration names none, which an assertion below turns into an error.
+  userGroup =
+    if cfg.user == "root" then "root"
+    else lib.attrByPath [ cfg.user "group" ] "" config.users.users;
+  declaredHome = lib.attrByPath [ cfg.user "home" ] "" config.users.users;
+
+  # Where the session's shell starts. root keeps its literal /root, so a host
+  # that never sets `user` renders the same file as before. Any other account
+  # starts in the home NixOS declares for it, and in / when the declaration has
+  # none: /root would be a directory that account cannot enter.
+  startDir =
+    if cfg.user == "root" then "/root"
+    else if declaredHome == "" then "/"
+    else declaredHome;
+  # systemd runs a unit as root when User= is absent, so root declares nothing
+  # and the units of a host that never sets `user` render exactly as before.
+  runAs = optionalAttrs (cfg.user != "root") { User = cfg.user; };
+  # Says what the rendered -c really is, so the comment and the value cannot
+  # disagree.
+  startComment =
+    if cfg.user == "root" then "-c /root: the shell starts in root's home."
+    else if startDir == "/" then "-c /: ${cfg.user} has no home other than /, so the shell starts in /."
+    else "-c ${startDir}: the shell starts in the home of ${cfg.user}.";
+  # The two rendered files are read by the tmux server, which runs as `user`.
+  # root keeps what NixOS gives a plain etc entry, so a host that never sets
+  # `user` changes nothing; any other account owns them, group read for the
+  # reader group, as install.sh does for the plain-systemd path.
+  etcOwner = optionalAttrs (cfg.user != "root") {
+    user = cfg.user;
+    group = cfg.readerGroup;
+    mode = "0640";
+  };
+
   envVars = {
     TMUX_SHARE_DIR = cfg.directory;
     TMUX_SHARE_SESSION = cfg.sessionName;
@@ -64,6 +102,10 @@ let
     TMUX_SHARE_GROUP = cfg.readerGroup;
   } // optionalAttrs (cfg.readerUser != null) {
     TMUX_SHARE_READER = cfg.readerUser;
+    # Named only when it is not root, so the verifier's default (root) and the
+    # env file of a host that never sets `user` stay as they were.
+  } // optionalAttrs (cfg.user != "root") {
+    TMUX_SHARE_USER = cfg.user;
   };
 
   # Shell-quoted KEY='value' lines, as tmux-share-render's `paths` mode writes
@@ -90,8 +132,8 @@ let
     ''
 
       # Created at server start, so the transcript tap and the operator's attach
-      # always find a session. -c /root: the shell starts in root's home.
-      new-session -d -s ${cfg.sessionName} -c /root
+      # always find a session. ${startComment}
+      new-session -d -s ${cfg.sessionName} -c ${startDir}
     ''
   ];
 in
@@ -105,6 +147,20 @@ in
       description = ''
         Name of the monitored tmux session. Must match
         ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$: it is written into tmux commands.
+      '';
+    };
+
+    user = mkOption {
+      type = types.str;
+      default = "root";
+      description = ''
+        The account that owns the tmux server, the socket, the transcript, the
+        lock and the markers, and that the server, tap and trimmer units run as.
+        An account declared in users.users, which this module does not create:
+        a unit for an account the host lacks fails at boot, so evaluation
+        refuses one. The lock is owned by the account and its primary group
+        (users.users.<user>.group), so that must be set. This account and root
+        are the accounts tmux-share-attach is meant for. It must not be readerUser.
       '';
     };
 
@@ -123,8 +179,9 @@ in
       description = ''
         An existing account that reads the transcript; the module adds it to
         readerGroup. The module does not create the account. It cannot know which
-        account the operator uses for tmux-share-attach, so it only forbids root.
-        null adds nobody: grant access later with `usermod -aG <group> <user>`.
+        account the operator uses for tmux-share-attach beyond `user`, so it
+        forbids root and `user`. null adds nobody: grant access later with
+        `usermod -aG <group> <user>`.
       '';
     };
 
@@ -160,7 +217,7 @@ in
       default = "${pkgs.fish}/bin/fish";
       description = ''
         Shell the operator gets inside the session (tmux default-shell). null leaves
-        tmux's default, which is root's login shell from the account database.
+        tmux's default, which is the login shell of `user` from the account database.
         An absolute path with only A-Za-z0-9_./- characters.
       '';
     };
@@ -182,11 +239,35 @@ in
         }
         {
           assertion = cfg.readerUser != "root";
-          message = "services.tmux-share.readerUser must not be \"root\": the reader is read-only by design, and root already reads everything. The module cannot tell which account is the operator, so it forbids only root.";
+          message = "services.tmux-share.readerUser must not be \"root\": the reader is read-only by design, and root already reads everything. The account in services.tmux-share.user is refused as a reader by a separate assertion.";
         }
         {
           assertion = cfg.readerUser == null || matches nameRe cfg.readerUser;
           message = "services.tmux-share.readerUser must be a plain account name ([A-Za-z0-9_][A-Za-z0-9_.-]*).";
+        }
+        {
+          assertion = matches nameRe cfg.user;
+          message = "services.tmux-share.user must be a plain account name ([A-Za-z0-9_][A-Za-z0-9_.-]*): it is written into tmpfiles rules and unit files, where a space or a ';' would change what they mean.";
+        }
+        {
+          # Units and tmpfiles rules name this account, and both fail at boot for
+          # one the host does not have. install.sh refuses the same case.
+          assertion = cfg.user == "root" || builtins.hasAttr cfg.user config.users.users;
+          message = "services.tmux-share.user (\"${cfg.user}\") must be root or an account declared in users.users: the units run as it and tmpfiles rules are owned by it, and both fail at boot, not at evaluation, for an account the host does not have. Declare it with users.users.${cfg.user} = { isNormalUser = true; ... };";
+        }
+        {
+          assertion = userGroup != "";
+          message = "users.users.${cfg.user}.group is empty, so the primary group of services.tmux-share.user cannot be determined: the lock file is owned by that group. Set users.users.${cfg.user}.group (a normal user gets \"users\" by default).";
+        }
+        {
+          assertion = cfg.readerUser == null || cfg.user != cfg.readerUser;
+          message = "services.tmux-share.user must not be the readerUser: the reader gets the transcript and never the socket, and the account that owns the server can drive its shell. The operator and the reader have to be different accounts.";
+        }
+        {
+          # "/" is the fallback for an account NixOS has no home for; the
+          # session's start directory is written into the tmux configuration.
+          assertion = startDir == "/" || matches pathRe startDir;
+          message = "the home of services.tmux-share.user (users.users.<user>.home) must be an absolute path with only A-Z a-z 0-9 _ . / - characters: it is written into the tmux configuration, where a ';' would start another tmux command.";
         }
         {
           assertion = matches nameRe cfg.readerGroup;
@@ -233,24 +314,27 @@ in
         ${cfg.readerUser}.extraGroups = [ cfg.readerGroup ];
       };
 
-      environment.etc."tmux-share/tmux.conf".text = tmuxConfText;
-      environment.etc."tmux-share/env".text = envText;
+      environment.etc."tmux-share/tmux.conf" = { text = tmuxConfText; } // etcOwner;
+      environment.etc."tmux-share/env" = { text = envText; } // etcOwner;
 
       # TRAP: the rules fix every mode. A "-" mode takes the creator's umask, so
       # the boundary would depend on who ran tmpfiles. Ages are "-" so /run
       # cleanup never removes a live file.
       systemd.tmpfiles.rules = [
         # The runtime directory: traverse for the group, never list. 0710 keeps
-        # the reader from enumerating what else is in it.
-        "d ${cfg.directory} 0710 root ${cfg.readerGroup} - -"
+        # the reader from enumerating what else is in it. It belongs to `user`,
+        # so the markers the scripts create inside it do too.
+        "d ${cfg.directory} 0710 ${cfg.user} ${cfg.readerGroup} - -"
         # The transcript: group read only. No group write, so the reader cannot
         # alter or truncate the record.
-        "f ${transcript} 0640 root ${cfg.readerGroup} - -"
-        # The lock: root only, and not group-readable. flock needs only read
-        # access, so a reader who could open it could stall the taps.
-        "f ${lock} 0600 root root - -"
+        "f ${transcript} 0640 ${cfg.user} ${cfg.readerGroup} - -"
+        # The lock: `user` only, and not group-readable. flock needs only read
+        # access, so a reader who could open it could stall the taps. The group is
+        # the account's primary group, which exists by construction; a group
+        # named after the account usually does not.
+        "f ${lock} 0600 ${cfg.user} ${userGroup} - -"
         # TRAP: no rule for the socket. tmux creates it itself, mode 0600 and
-        # owned by root. A rule that pre-created it would have to pick a mode,
+        # owned by `user`. A rule that pre-created it would have to pick a mode,
         # and any mode wider than tmux's own would undo the boundary.
       ];
 
@@ -260,7 +344,7 @@ in
         # lives in; without the ordering the server can start before it exists.
         after = [ "local-fs.target" "systemd-tmpfiles-setup.service" ];
         wantedBy = [ "multi-user.target" ];
-        serviceConfig = {
+        serviceConfig = runAs // {
           # The tmux server with -D stays in the foreground, and systemd tracks it.
           Type = "simple";
           # TRAP: the leading "-" lets the server start without the env file.
@@ -289,7 +373,7 @@ in
         # Ordered behind the server, but no Requires/Wants: a pass never starts or
         # restarts the server.
         after = [ "tmux-share-server.service" ];
-        serviceConfig = {
+        serviceConfig = runAs // {
           # TRAP: oneshot with RemainAfterExit=no. A oneshot left active is never
           # started again by its timer, so the watchdog would run once and stop.
           Type = "oneshot";
@@ -317,7 +401,7 @@ in
       systemd.services.tmux-share-trim = {
         description = "tmux-share transcript trimmer";
         after = [ "tmux-share-server.service" ];
-        serviceConfig = {
+        serviceConfig = runAs // {
           # TRAP: the same oneshot rule as the watchdog (RemainAfterExit=no).
           Type = "oneshot";
           RemainAfterExit = false;

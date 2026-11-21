@@ -9,13 +9,17 @@
 #
 # CHECKS (reported through core/lib/checks.sh, in this order)
 #   1. deploy-dir-traversable-not-listable
-#        directory exists, mode 0710 or 0750, owned root:<group>
+#        directory exists, mode 0710 or 0750, owned <user>:<group>
 #   2. transcript-mode-owner
-#        transcript exists, mode 0640, owned root:<group>
+#        transcript exists, mode 0640, owned <user>:<group>
 #   3. socket-owner-only
-#        socket exists, mode 0600 or 0700, owned root:root
+#        socket exists, mode 0600 or 0700, owned <user>:<user's primary group>
 #   4. lock-mode-owner
-#        lock file, if present, mode 0600, owned root:root
+#        lock file, if present, mode 0600, owned <user>:<user's primary group>
+#        (tmux gives the socket that group, and the module and installer give
+#        the lock the same one: a group named after the account is not
+#        assumed, since a normal NixOS account has primary group "users")
+#   <user> is TMUX_SHARE_USER, root when it is not set.
 #   5. reader-cannot-connect-socket
 #        a unix connect from the CURRENT user must fail with EACCES/EPERM.
 #        See "CHECK 5" below.
@@ -66,6 +70,8 @@
 #   TMUX_SHARE_TIMEOUT=timeout
 #   TMUX_SHARE_LIBDIR=<core/lib>
 # Specific to the verifier:
+#   TMUX_SHARE_USER=root               the account that owns the server, the
+#                                      socket, the transcript and the lock
 #   TMUX_SHARE_GROUP=tmux-share        transcript group
 #   TMUX_SHARE_READER=                 reader account (unset: check 9 skips)
 #   TMUX_SHARE_BINDIR=<this directory> installed script directory (check 6;
@@ -74,12 +80,13 @@
 #   TMUX_SHARE_UNIT_TAP=tmux-share-tap.service
 #   TMUX_SHARE_UNIT_TRIM=tmux-share-trim.service
 #   TMUX_SHARE_UNIT_SERVER=tmux-share-server.service
-#   TMUX_SHARE_VERIFY_OWNER=root:root  expected USER:GROUP of the socket and
-#                                      lock; its USER part is also the
-#                                      expected owner of the directory and
-#                                      transcript. Exists so a test tree
-#                                      built without root can be verified;
-#                                      do not set it in production.
+#   TMUX_SHARE_VERIFY_OWNER=USER:GROUP  overrides the expected owner of the
+#                                      socket and lock; its USER part is also
+#                                      the expected owner of the directory and
+#                                      transcript. Default: derived from
+#                                      TMUX_SHARE_USER. Exists so a test tree
+#                                      built by another account can be
+#                                      verified; do not set it in production.
 #   TMUX_SHARE_PYTHON=python3          interpreter for the connect probe
 set -eu
 
@@ -93,6 +100,7 @@ LOCK=${TMUX_SHARE_LOCK:-/run/tmux-share.lock}
 STAMP=${TMUX_SHARE_STAMP:-$CORE_DIR/tmux-share-stamp}
 TIMEOUT=${TMUX_SHARE_TIMEOUT:-timeout}
 LIBDIR=${TMUX_SHARE_LIBDIR:-$CORE_DIR/lib}
+USER_NAME=${TMUX_SHARE_USER:-root}
 GROUP=${TMUX_SHARE_GROUP:-tmux-share}
 READER=${TMUX_SHARE_READER:-}
 BINDIR=${TMUX_SHARE_BINDIR:-$HERE}
@@ -100,7 +108,7 @@ UNITDIR=${TMUX_SHARE_UNITDIR:-/etc/systemd/system}
 UNIT_TAP=${TMUX_SHARE_UNIT_TAP:-tmux-share-tap.service}
 UNIT_TRIM=${TMUX_SHARE_UNIT_TRIM:-tmux-share-trim.service}
 UNIT_SERVER=${TMUX_SHARE_UNIT_SERVER:-tmux-share-server.service}
-OWNER=${TMUX_SHARE_VERIFY_OWNER:-root:root}
+OWNER=${TMUX_SHARE_VERIFY_OWNER:-}
 PYTHON=${TMUX_SHARE_PYTHON:-python3}
 
 prog=tmux-share-verify
@@ -144,6 +152,19 @@ _account_ok() {
     return 0
 }
 _account_ok "$GROUP" || die "TMUX_SHARE_GROUP rejected: not a plain group name"
+_account_ok "$USER_NAME" || die "TMUX_SHARE_USER rejected: not a plain account name"
+# SOCK_OWNER is what the socket and the lock must be owned by. tmux creates the
+# socket with the server's primary group, and the lock is given that same group
+# by the module and the installer, so one expectation serves both. The group
+# need not be named like the account; it is looked up, and only an account the
+# host cannot resolve falls back to the account's name. For root both are
+# root:root.
+if [ -n "$OWNER" ]; then
+    SOCK_OWNER=$OWNER
+else
+    SOCK_OWNER=$USER_NAME:$(id -gn -- "$USER_NAME" 2>/dev/null || printf '%s' "$USER_NAME")
+    OWNER=$SOCK_OWNER
+fi
 case $OWNER in
     ?*:?*) ;;
     *) die "TMUX_SHARE_VERIFY_OWNER rejected: want USER:GROUP" ;;
@@ -202,7 +223,7 @@ if _need 'socket' "$SOCK"; then
         check_fail "$SOCK is not a socket"
     fi
     check_mode "$SOCK" '0600|0700'
-    check_owner "$SOCK" "$OWNER"
+    check_owner "$SOCK" "$SOCK_OWNER"
 fi
 
 # ---- 4. lock file ----------------------------------------------------------

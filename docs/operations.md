@@ -4,7 +4,7 @@ Day-to-day use of a running tmux-share deployment. The two install paths are des
 
 ## Attaching
 
-`tmux-share-attach` is root-only and runs one fixed, validated tmux command. Detach from a session with tmux's usual `Ctrl-b d`.
+`tmux-share-attach` runs one fixed, validated tmux command. It is meant for root and for the account that owns the runtime directory (the configured `user`, root by default). When run from any other account it says so, naming the account, instead of showing a tmux error. That message is a courtesy to the operator, not a control: it looks at the directory of `TMUX_SHARE_SOCK`, which the caller supplies, so a caller can name a directory they own and get past it. What actually stops a third account is the kernel: the socket is created by tmux with mode 0600 and is owned by the service account, so `connect(2)` fails for everyone else, and the runtime directory is 0710 and owned by the service account, so nobody else can list it or place anything in it. Do not rely on the wrapper to keep anyone out. Detach from a session with tmux's usual `Ctrl-b d`.
 
 ```sh
 sudo tmux-share-attach

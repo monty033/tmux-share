@@ -20,6 +20,7 @@ ExecStartPost=-/usr/local/bin/tmux-share-tap-start
 Restart=on-failure
 # RestartSec: do not spin if the server dies at once.
 RestartSec=2
+# User= is absent on purpose, so this unit runs as root. `install.sh --user NAME` writes a copy of this unit (and of the tap and trim services) with User=NAME, together with tmpfiles rules owned by NAME; this file stays the root default.
 # NOT declared, on purpose: RuntimeDirectory (tmpfiles owns /run/tmux-share at 0710; the unit would recreate it 0755).
 # NOT declared, on purpose: UMask (the server's umask becomes the operator shell's umask).
 

@@ -2,16 +2,18 @@
 # tmux-share-attach: the operator's command to attach to the monitored session.
 #
 # WHY THIS COMMAND EXISTS
-#   The tmux server socket is owned by root and is not group- or
-#   world-accessible, so attaching needs root and a fixed, validated command
-#   line. This wrapper is that command line. The reader account never gets
-#   this command and never gets access to the socket: it reads the
-#   transcript file and nothing else.
+#   The tmux server socket is owned by the operator account (root unless the
+#   deployment sets a `user`) and is not group- or world-accessible, so
+#   attaching needs that account and a fixed, validated command line. This
+#   wrapper is that command line. The reader account never gets this command
+#   and never gets access to the socket: it reads the transcript file and
+#   nothing else.
 #
 # USAGE
 #   tmux-share-attach [--check] [TMUX ATTACH OPTIONS...]
 #
-#   Runs, as root only:   $TMUX_SHARE_TMUX -S $SOCK attach -t $SESSION "$@"
+#   Runs, as root or as the account that owns the runtime directory:
+#                         $TMUX_SHARE_TMUX -S $SOCK attach -t $SESSION "$@"
 #   Operator arguments are appended after the session, so tmux options such
 #   as -r (read-only) or -d (detach other clients) pass straight through.
 #
@@ -19,15 +21,30 @@
 #             Print the exact argv that would be executed, on one line, and
 #             exit 0 without executing it. Works for any caller, root or not,
 #             so an operator can see what would run and tests can assert it
-#             without root. It does not weaken the root requirement: the only
-#             thing --check can do is print; it never reaches exec. The real
-#             path refuses a non-root caller before any validation or tmux
-#             call. There is deliberately no environment variable or flag
-#             that overrides the uid test.
+#             without root. It only prints; it never reaches exec.
+#
+# WHO MAY ATTACH, AND WHAT THIS CHECK IS NOT
+#   The check below is a courtesy to the operator, not a control. It refuses,
+#   with a message that names the right account, a caller who is neither root
+#   nor the owner of the directory the socket lives in, so that someone who
+#   is on the wrong account is told so instead of getting a tmux error.
+#
+#   It cannot stop anyone who means to get past it. The directory is taken
+#   from TMUX_SHARE_SOCK, which the caller supplies, so a caller can name a
+#   directory they own and pass. Nothing is lost by that: the check was never
+#   what kept a third account out. What does is the kernel:
+#     - the socket is created by tmux, mode 0600, owned by the service
+#       account, so connect(2) fails for every other account whatever this
+#       script says; and
+#     - the runtime directory is 0710 and owned by the service account, so the
+#       reader group can reach files in it by name but cannot list it, create
+#       or replace anything in it, or put a socket of its own where the
+#       operator's tmux would find it.
+#   Do not rely on this script to keep anyone out.
 #
 # EXIT STATUS
 #   0  --check printed an argv (or tmux, via exec, replaced this process)
-#   1  caller is not root, or a configuration value failed validation
+#   1  caller may not attach, or a configuration value failed validation
 #
 # ENVIRONMENT (shared contract, all overridable)
 #   TMUX_SHARE_DIR      default /run/tmux-share
@@ -64,10 +81,30 @@ for a in "$@"; do
     fi
 done
 
-# Root gate for the real path. Checked before anything else so a non-root
-# caller causes no validation work and no tmux call.
+# Courtesy check for the real path (see the header: it is not a security
+# control). It runs before validation so a caller on the wrong account gets the
+# useful message first. The directory is the socket's own parent, so naming a
+# directory through TMUX_SHARE_DIR alone changes nothing; naming the socket
+# itself does, and that is accepted. The value is only stat'ed here, never
+# expanded into a command.
 if [ "$check" -eq 0 ] && [ "$EUID" -ne 0 ]; then
-    die "this command is root-only (the tmux socket is root-owned); re-run as root"
+    rundir=${TMUX_SHARE_SOCK%/*}
+    [ -n "$rundir" ] || rundir=/
+    if ! { [ -d "$rundir" ] && [ -O "$rundir" ]; }; then
+        # The name is for the message only: nothing decides on it.
+        owner=$(stat -c %U -- "$rundir" 2>/dev/null || true)
+        case $owner in
+            root)
+                die "this command is root-only (the runtime directory $rundir is owned by root); re-run as root"
+                ;;
+            ?*)
+                die "this command may be run only by root or by $owner (the owner of the runtime directory $rundir); re-run as one of them"
+                ;;
+            *)
+                die "this command may be run only by root or by the account that owns the runtime directory $rundir, which does not exist yet; re-run as root"
+                ;;
+        esac
+    fi
 fi
 
 # shellcheck source=../lib/validate.sh
