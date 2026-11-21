@@ -75,7 +75,7 @@ under DIR.
   --dry-run        list every file, destination and mode; change nothing
   --help           show this help
 
-TMUX_SHARE_* environment variables override the defaults (CORE-CONTRACT.md).
+TMUX_SHARE_* environment variables override the defaults (docs/operations.md).
 TMUX_SHARE_LIBDIR and TMUX_SHARE_STAMP are fixed by the layout and ignored.
 EOF
 }
