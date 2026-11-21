@@ -309,6 +309,28 @@ check_eq "hostile pane id: no pipe-pane call mentions it" "$(count_args '^pipe-p
 check_eq "hostile pane id: valid panes still tapped" "$(pipe_of '%0')$(pipe_of '%1')" 11
 check_contains "hostile pane id: message names it" "$OUT" '%7'
 
+# ---- 11. a transcript created here is readable by the reader group -----------
+# The reader is in the runtime directory's group and nothing else, so a log this
+# script creates must carry that group and be group-readable. It used to inherit
+# the caller's group, which for the root deployment locked the reader out until
+# the next activation rewrote the mode.
+new_env logperm
+run_script
+check_eq "log creation: exits 0" "$RC" 0
+check_eq "log creation: mode is 0640" "$(stat -c '%a' "$LOG")" 640
+check_eq "log creation: group matches the runtime directory" \
+    "$(stat -c '%G' "$LOG")" "$(stat -c '%G' "$T")"
+
+# ---- 12. a transcript the reader cannot read stops the tap --------------------
+# Silence here is the dangerous outcome: the reader sees an empty transcript and
+# nothing anywhere says why.
+new_env unreadable
+( umask 077; : > "$LOG" )
+run_script
+if [ "$RC" -ne 0 ]; then pass "unreadable log: exits non-zero"; else fail "unreadable log: exits non-zero"; fi
+check_contains "unreadable log: names the mode" "$OUT" 'mode 600'
+check_eq "unreadable log: nothing attached" "$(count_args '^pipe-pane ')" 0
+
 # ---- summary ------------------------------------------------------------------
 printf '\n%s passed, %s failed\n' "$PASSES" "$FAILS"
 if [ "$FAILS" -eq 0 ]; then

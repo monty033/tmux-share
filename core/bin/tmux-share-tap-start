@@ -97,7 +97,22 @@ fi
 # ---- the log ----------------------------------------------------------------
 if [ ! -e "$LOG" ]; then
     ( umask 027; : >> "$LOG" ) || die "cannot create log $LOG"
+    # A transcript created here inherits this process's group, which for a
+    # root deployment is root: the reader group would then be locked out until
+    # the next activation rewrote the mode. Copy the group from the runtime
+    # directory the module created for exactly this purpose, and refuse to go on
+    # if the reader still cannot read the file -- a silent lockout looks exactly
+    # like an empty transcript to whoever is reading it.
+    chgrp --reference="$TMUX_SHARE_DIR" -- "$LOG" 2>/dev/null || true
+    if [ "$(stat -c '%G' -- "$LOG")" != "$(stat -c '%G' -- "$TMUX_SHARE_DIR")" ]; then
+        die "log $LOG is group $(stat -c '%G' -- "$LOG") but $TMUX_SHARE_DIR is group $(stat -c '%G' -- "$TMUX_SHARE_DIR"); the reader group cannot read the transcript"
+    fi
 fi
+log_mode=$(stat -c '%a' -- "$LOG")
+case ${log_mode: -2:1} in
+    4|5|6|7) ;;
+    *) die "log $LOG has mode $log_mode; the reader group has no read access" ;;
+esac
 
 # ---- enumerate panes --------------------------------------------------------
 if panes=$("$TIMEOUT" "$TMUX_SECS" "$TMUX" -S "$SOCK" list-panes -s -t "$SESSION" \

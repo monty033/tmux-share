@@ -314,7 +314,9 @@ in
         history-limit). null writes nothing, so tmux keeps its own default of
         2000 lines: this module has never written a history-limit, and writing
         one now would change the rendered file of every deployment that
-        exists. The live host sets 2000, which is that same default.
+        exists. A deployment that has always run a larger buffer sets this to
+        the value it uses, so the switch to this module does not silently
+        shrink it.
         A positive integer: the option names a bound on the scroll-back
         buffer, and zero is not a bound.
       '';

@@ -198,6 +198,15 @@ mutate_case 'watchdog: pipe-pane -o re-added is caught' \
     tests/unit/watchdog_test.sh core/bin/tmux-share-watchdog edit_file \
     'pipe-pane -t "$pane" "$cmd"' 'pipe-pane -o -t "$pane" "$cmd"'
 
+mutate_case 'tap: the transcript is created with the caller umask' \
+    tests/unit/tap_start_test.sh core/bin/tmux-share-tap-start edit_file \
+    '( umask 027; : >> "$LOG" )' '( umask 022; : >> "$LOG" )'
+
+mutate_case 'tap: an unreadable transcript no longer stops the tap' \
+    tests/unit/tap_start_test.sh core/bin/tmux-share-tap-start edit_file \
+    '*) die "log $LOG has mode $log_mode; the reader group has no read access" ;;' \
+    '*) : ;;'
+
 mutate_case 'server unit: ExecStartPost loses its leading -' \
     tests/systemd/units_test.sh systemd/tmux-share-server.service edit_file \
     'ExecStartPost=-/usr/local/bin/tmux-share-tap-start' \
