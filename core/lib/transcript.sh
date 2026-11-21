@@ -50,17 +50,21 @@ ensure_transcript() {
         return 1
     fi
 
+    # The contract is 0640, not "some mode with the group bit set": a transcript
+    # that is readable by everyone is the leak this design exists to avoid, and a
+    # caller who cannot tighten it must say so rather than carry on.
+    if [ "$(stat -c '%a' -- "$file")" != "640" ]; then
+        chmod 0640 -- "$file" 2>/dev/null || true
+    fi
+
     mode=$(stat -c '%a' -- "$file") || {
         TRANSCRIPT_REASON="cannot read the mode of $file"
         return 1
     }
-    case ${mode: -2:1} in
-        4 | 5 | 6 | 7) ;;
-        *)
-            TRANSCRIPT_REASON="$file has mode $mode; the reader group has no read access"
-            return 1
-            ;;
-    esac
+    if [ "$mode" != "640" ]; then
+        TRANSCRIPT_REASON="$file has mode $mode; it must be 0640 so the reader group can read it and nobody else can"
+        return 1
+    fi
 
     return 0
 }

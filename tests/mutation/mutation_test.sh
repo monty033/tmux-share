@@ -198,15 +198,9 @@ mutate_case 'watchdog: pipe-pane -o re-added is caught' \
     tests/unit/watchdog_test.sh core/bin/tmux-share-watchdog edit_file \
     'pipe-pane -t "$pane" "$cmd"' 'pipe-pane -o -t "$pane" "$cmd"'
 
-mutate_case 'transcript helper: an unreadable file is accepted' \
+mutate_case 'transcript helper: a 0644 transcript is left wide' \
     tests/unit/tap_start_test.sh core/lib/transcript.sh edit_file \
-    '            TRANSCRIPT_REASON="$file has mode $mode; the reader group has no read access"
-            return 1' \
-    '            :'
-
-mutate_case 'transcript helper: the file is created with the caller umask' \
-    tests/unit/tap_start_test.sh core/lib/transcript.sh edit_file \
-    '( umask 027; : >> "$file" )' '( umask 022; : >> "$file" )'
+    'chmod 0640 -- "$file" 2>/dev/null || true' ':'
 
 mutate_case 'watchdog: the transcript is left to the attach redirection' \
     tests/unit/watchdog_test.sh core/bin/tmux-share-watchdog edit_file \

@@ -27,12 +27,14 @@ sudo tmux-share -d
 
 ## Reading the transcript
 
-The transcript is created readable by the reader group, not by the world. If the
-tap finds the file missing it creates it with mode `0640` and the same group as
-the runtime directory, and it refuses to attach if the file it finds is one the
-reader group cannot read. That refusal is deliberate: a silently unreadable
-transcript looks exactly like an idle session to whoever is reading it, and the
-failure would otherwise be found by the reader, days later.
+The transcript is readable by the reader group and by nobody else: mode `0640`,
+group taken from the runtime directory. Both the tap and the watchdog establish
+that before they attach anything, because both can be the one that creates the
+file — on a fresh boot, after `/run` is cleared, and after the watchdog recovers
+from a deleted transcript. A file they find in any other state is corrected to
+`0640`; one they cannot correct stops them with a message, rather than leaving the
+reader with a file that silently is not there. An unreadable transcript looks
+exactly like an idle session to whoever is reading it.
 
 From the reader account, read `/run/tmux-share/transcript.log`. The file contains untrusted bytes, including escape sequences and text shaped like instructions, so avoid dumping it raw to a terminal. Use a viewer that makes control characters visible:
 

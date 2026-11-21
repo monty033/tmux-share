@@ -210,7 +210,9 @@ chmod 0664 "$LOG"
 run_script
 check_eq "existing log: exits 0" "$RC" 0
 check_eq "existing log: content untouched" "$(cat "$LOG")" keep
-check_eq "existing log: mode untouched" "$(mode_of "$LOG")" 664
+# 0664 was tolerated before the transcript contract was enforced. The content is
+# what must survive; the mode is corrected to 0640.
+check_eq "existing log: mode corrected to 0640" "$(mode_of "$LOG")" 640
 
 # ---- 5. a session that never appears ----------------------------------------
 new_env missing
@@ -321,15 +323,24 @@ check_eq "log creation: mode is 0640" "$(stat -c '%a' "$LOG")" 640
 check_eq "log creation: group matches the runtime directory" \
     "$(stat -c '%G' "$LOG")" "$(stat -c '%G' "$T")"
 
-# ---- 12. a transcript the reader cannot read stops the tap --------------------
-# Silence here is the dangerous outcome: the reader sees an empty transcript and
-# nothing anywhere says why.
-new_env unreadable
+# ---- 11b. a too-permissive transcript is tightened, not tolerated ------------
+# 0644 would let every account on the host read the operator's terminal.
+new_env logwide
+( umask 022; : > "$LOG" )
+run_script
+check_eq "wide log: exits 0" "$RC" 0
+check_eq "wide log: tightened to 0640" "$(stat -c '%a' "$LOG")" 640
+
+# ---- 12. an owner-only transcript is repaired before the tap attaches -------
+# A file the service account owns is fixable, so it is fixed rather than refused.
+# What must not happen is attaching and leaving the reader with a file they
+# cannot open.
+new_env owneronly
 ( umask 077; : > "$LOG" )
 run_script
-if [ "$RC" -ne 0 ]; then pass "unreadable log: exits non-zero"; else fail "unreadable log: exits non-zero"; fi
-check_contains "unreadable log: names the mode" "$OUT" 'mode 600'
-check_eq "unreadable log: nothing attached" "$(count_args '^pipe-pane ')" 0
+check_eq "owner-only log: exits 0" "$RC" 0
+check_eq "owner-only log: repaired to 0640" "$(stat -c '%a' "$LOG")" 640
+check_eq "owner-only log: taps attached" "$(count_args '^pipe-pane ')" 2
 
 # ---- summary ------------------------------------------------------------------
 printf '\n%s passed, %s failed\n' "$PASSES" "$FAILS"
