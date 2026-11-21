@@ -41,7 +41,7 @@ sudo ./install.sh --user <operator>
 - `tmux-share-server.service`, `tmux-share-tap.service` and `tmux-share-trim.service` gain `User=NAME`. The tmpfiles rules own the directory and transcript `NAME:READER-GROUP` and the lock `NAME:<primary group of NAME>`, looked up with `getent`. A group named like the account is not needed; the installer exits 2 if the primary group cannot be resolved.
 - `/etc/tmux-share/tmux.conf` and `/etc/tmux-share/env` are mode 0640 and owned `NAME:READER-GROUP`. `NAME` owns them because the tmux server runs as `NAME` and has to read them, and the reader group can read them too. (The NixOS module writes the same ownership for a non-root `user`; for root it keeps its older root:root 0644, so the two paths differ there.)
 - The session starts in the unit's working directory (`/`), not in a home directory.
-- `tmux-share-attach` is meant for `NAME` and root, and tells anyone else so. That is a courtesy; the socket's mode and the runtime directory's ownership are what keep other accounts out (see `operations.md`). For verification, run `TMUX_SHARE_USER=NAME tmux-share-verify` after sourcing `/etc/tmux-share/env`, which already names it.
+- `tmux-share` is meant for `NAME` and root, and tells anyone else so. That is a courtesy; the socket's mode and the runtime directory's ownership are what keep other accounts out (see `operations.md`). For verification, run `TMUX_SHARE_USER=NAME tmux-share-verify` after sourcing `/etc/tmux-share/env`, which already names it.
 
 ## 3. The real install
 

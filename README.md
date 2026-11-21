@@ -36,15 +36,15 @@ Plain systemd, three commands from the checkout, as root:
 ```sh
 sudo ./install.sh
 sudo systemctl enable --now tmux-share-server.service
-tmux-share-attach --check
+tmux-share --check
 ```
 
 See docs/install-nixos.md and docs/install-systemd.md for the full steps.
 
 ## Commands an operator uses
 
-- `tmux-share-attach` — attach to the monitored session. Meant for root and the configured service account (root by default); the wrapper's account check is a courtesy, and the socket's mode 0600 plus the service account's ownership of the runtime directory are what stop any other account.
-- `tmux-share-attach --check` — print the exact argv without running it; works for any user.
+- `tmux-share` — attach to the monitored session. Meant for root and the configured service account (root by default); the wrapper's account check is a courtesy, and the socket's mode 0600 plus the service account's ownership of the runtime directory are what stop any other account.
+- `tmux-share --check` — print the exact argv without running it; works for any user.
 - `tmux-share-verify` — static check of modes, ownership, units and the stamp filter; run as root and again as the reader account.
 - `tmux-share-preflight` — probe this host's tmux before a plain-systemd install.
 - `systemctl status tmux-share-server.service` and `systemctl list-timers tmux-share-tap.timer tmux-share-trim.timer` — unit health.

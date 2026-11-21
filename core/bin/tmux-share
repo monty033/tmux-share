@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tmux-share-attach: the operator's command to attach to the monitored session.
+# tmux-share: the operator's command to attach to the monitored session.
 #
 # WHY THIS COMMAND EXISTS
 #   The tmux server socket is owned by the operator account (root unless the
@@ -10,7 +10,7 @@
 #   nothing else.
 #
 # USAGE
-#   tmux-share-attach [--check] [TMUX ATTACH OPTIONS...]
+#   tmux-share [--check] [TMUX ATTACH OPTIONS...]
 #
 #   Runs, as root or as the account that owns the runtime directory:
 #                         $TMUX_SHARE_TMUX -S $SOCK attach -t $SESSION "$@"
@@ -54,7 +54,7 @@
 #   TMUX_SHARE_LIBDIR   default <this script's directory>/../lib
 set -eu
 
-prog=tmux-share-attach
+prog=tmux-share
 
 here=${BASH_SOURCE[0]%/*}
 [ "$here" != "${BASH_SOURCE[0]}" ] || here=.

@@ -243,15 +243,15 @@ mutate_case 'module: transcript stays root-owned for another account' \
     '"f ${transcript} 0640 root ${cfg.readerGroup} - -"'
 
 mutate_case 'attach: the gate is removed' \
-    tests/unit/attach_test.sh core/bin/tmux-share-attach edit_file \
+    tests/unit/attach_test.sh core/bin/tmux-share edit_file \
     'if [ "$check" -eq 0 ] && [ "$EUID" -ne 0 ]; then' 'if false; then'
 
 mutate_case 'attach: the gate reads TMUX_SHARE_DIR, which a caller can set' \
-    tests/unit/attach_test.sh core/bin/tmux-share-attach edit_file \
+    tests/unit/attach_test.sh core/bin/tmux-share edit_file \
     'rundir=${TMUX_SHARE_SOCK%/*}' 'rundir=${TMUX_SHARE_DIR:-${TMUX_SHARE_SOCK%/*}}'
 
 mutate_case 'attach: the gate asks id on PATH instead of the kernel' \
-    tests/unit/attach_test.sh core/bin/tmux-share-attach edit_file \
+    tests/unit/attach_test.sh core/bin/tmux-share edit_file \
     '[ -O "$rundir" ]' '[ "$(id -u)" = "$(stat -c %u -- "$rundir")" ]'
 
 mutate_case 'verify: expected owner is root whatever the user' \

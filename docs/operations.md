@@ -4,23 +4,23 @@ Day-to-day use of a running tmux-share deployment. The two install paths are des
 
 ## Attaching
 
-`tmux-share-attach` runs one fixed, validated tmux command. It is meant for root and for the account that owns the runtime directory (the configured `user`, root by default). When run from any other account it says so, naming the account, instead of showing a tmux error. That message is a courtesy to the operator, not a control: it looks at the directory of `TMUX_SHARE_SOCK`, which the caller supplies, so a caller can name a directory they own and get past it. What actually stops a third account is the kernel: the socket is created by tmux with mode 0600 and is owned by the service account, so `connect(2)` fails for everyone else, and the runtime directory is 0710 and owned by the service account, so nobody else can list it or place anything in it. Do not rely on the wrapper to keep anyone out. Detach from a session with tmux's usual `Ctrl-b d`.
+`tmux-share` runs one fixed, validated tmux command. It is meant for root and for the account that owns the runtime directory (the configured `user`, root by default). When run from any other account it says so, naming the account, instead of showing a tmux error. That message is a courtesy to the operator, not a control: it looks at the directory of `TMUX_SHARE_SOCK`, which the caller supplies, so a caller can name a directory they own and get past it. What actually stops a third account is the kernel: the socket is created by tmux with mode 0600 and is owned by the service account, so `connect(2)` fails for everyone else, and the runtime directory is 0710 and owned by the service account, so nobody else can list it or place anything in it. Do not rely on the wrapper to keep anyone out. Detach from a session with tmux's usual `Ctrl-b d`.
 
 ```sh
-sudo tmux-share-attach
+sudo tmux-share
 ```
 
 To see exactly what would run without running it (works for any user, no root needed):
 
 ```sh
-tmux-share-attach --check
+tmux-share --check
 ```
 
 tmux options are appended after the session name, so they pass straight through:
 
 ```sh
-sudo tmux-share-attach -r
-sudo tmux-share-attach -d
+sudo tmux-share -r
+sudo tmux-share -d
 ```
 
 `-r` makes the *client* read-only and `-d` detaches other clients. `-r` is a convenience, not a security boundary: bindings that call `run-shell` still execute as the server owner. The reader account gets neither this command nor the socket. Remember that restarting the server ends your attached session.
@@ -106,7 +106,7 @@ sudo ./install.sh --session ops-shell
 sudo systemctl restart tmux-share-server.service
 ```
 
-Both paths restart the server, which drops the operator's attached session and its panes; perform the change from outside that session. The name must match `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$` — the same rule the scripts enforce at run time. Anything still using the old name, such as a manually written `tmux-share-attach` command, must be updated too.
+Both paths restart the server, which drops the operator's attached session and its panes; perform the change from outside that session. The name must match `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$` — the same rule the scripts enforce at run time. Anything still using the old name, such as a manually written `tmux-share` command, must be updated too.
 
 ## Uninstalling cleanly
 

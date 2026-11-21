@@ -160,7 +160,7 @@ in
         a unit for an account the host lacks fails at boot, so evaluation
         refuses one. The lock is owned by the account and its primary group
         (users.users.<user>.group), so that must be set. This account and root
-        are the accounts tmux-share-attach is meant for. It must not be readerUser.
+        are the accounts tmux-share is meant for. It must not be readerUser.
       '';
     };
 
@@ -179,7 +179,7 @@ in
       description = ''
         An existing account that reads the transcript; the module adds it to
         readerGroup. The module does not create the account. It cannot know which
-        account the operator uses for tmux-share-attach beyond `user`, so it
+        account the operator uses for tmux-share beyond `user`, so it
         forbids root and `user`. null adds nobody: grant access later with
         `usermod -aG <group> <user>`.
       '';

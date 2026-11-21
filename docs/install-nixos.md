@@ -65,7 +65,7 @@ The account must be declared in `users.users` (`isNormalUser = true;` is enough)
 
 ## What the module creates
 
-- Puts the package in `environment.systemPackages`, so `tmux-share-attach`, `tmux-share-verify` and `tmux-share-render` are on PATH. The wrappers in the package source `/etc/tmux-share/env` when it exists.
+- Puts the package in `environment.systemPackages`, so `tmux-share`, `tmux-share-verify` and `tmux-share-render` are on PATH. The wrappers in the package source `/etc/tmux-share/env` when it exists.
 - Creates the reader group through `users.groups`, named after `readerGroup`, and adds `readerUser` to it through `extraGroups` when set. It never creates the reader account.
 - Writes `/etc/tmux-share/tmux.conf` (`exit-empty on`, optional `default-shell`, and `new-session -d`) and `/etc/tmux-share/env` (the `TMUX_SHARE_*` contract) through `environment.etc`.
 - Adds tmpfiles rules: `directory` mode 0710 `user`:readerGroup, transcript mode 0640 `user`:readerGroup, and a sibling `directory.lock` mode 0600 `user`:`user` (`user` is root unless set; the lock group is the account's primary group). There is deliberately no rule for the socket; tmux creates it itself, owner-only.

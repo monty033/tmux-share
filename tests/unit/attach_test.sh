@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Unit test for core/bin/tmux-share-attach. Needs no root and no real tmux:
+# Unit test for core/bin/tmux-share. Needs no root and no real tmux:
 # the tmux binary is a recording stub, so "nothing is executed" is observable.
 # Exit 0 only if every case passes.
 #
@@ -15,7 +15,7 @@ set -eu
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "${script_dir}/../.." && pwd)
-attach=$repo_root/core/bin/tmux-share-attach
+attach=$repo_root/core/bin/tmux-share
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/attach-test.XXXXXX")
 cleanup() { rm -rf -- "$work"; }
@@ -55,7 +55,7 @@ if [ "$(id -u)" -ne 0 ]; then
   export TMUX_SHARE_SOCK=$rootsock
   run
   if [ "$rc" -eq 1 ]; then pass 'non-root: exits 1'; else fail "non-root: exits 1 (rc=$rc)"; fi
-  if grep -q 'tmux-share-attach' "$err" && grep -q 'root-only' "$err"; then
+  if grep -q 'tmux-share' "$err" && grep -q 'root-only' "$err"; then
     pass 'non-root, root-owned runtime directory: message names the command and says root-only'
   else
     fail "non-root, root-owned runtime directory: message names the command and says root-only ($(cat "$err"))"

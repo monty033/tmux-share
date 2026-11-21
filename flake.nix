@@ -12,7 +12,7 @@
       eachSystem = f: lib.genAttrs systems (system: f system nixpkgs.legacyPackages.${system});
 
       scripts = [
-        "tmux-share-attach"
+        "tmux-share"
         "tmux-share-preflight"
         "tmux-share-render"
         "tmux-share-tap-start"
@@ -27,7 +27,7 @@
       #
       # bin/ holds one wrapper per command, not a symlink. TRAP: a symlink
       # changes $0 to the bin/ path, so the scripts would look for lib/ and the
-      # stamp filter one level too high, and tmux-share-attach would fail to
+      # stamp filter one level too high, and tmux-share would fail to
       # load validate.sh at all. The wrapper execs the real script, so $0 is
       # right. It also puts the tools the scripts call on PATH, and loads
       # /etc/tmux-share/env when the module wrote it, so the operator's attach
