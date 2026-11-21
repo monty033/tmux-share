@@ -202,6 +202,10 @@ mutate_case 'transcript helper: a 0644 transcript is left wide' \
     tests/unit/tap_start_test.sh core/lib/transcript.sh edit_file \
     'chmod 0640 -- "$file" 2>/dev/null || true' ':'
 
+mutate_case 'watchdog: a dead filter is trusted as a live tap' \
+    tests/unit/watchdog_test.sh core/bin/tmux-share-watchdog edit_file \
+    'if [ "$pipe" = 1 ] && ! stamp_running; then' 'if false; then'
+
 mutate_case 'watchdog: the transcript is left to the attach redirection' \
     tests/unit/watchdog_test.sh core/bin/tmux-share-watchdog edit_file \
     'if ! ensure_transcript "$DIR" "$LOG"; then' 'if false; then'

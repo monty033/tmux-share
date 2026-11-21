@@ -95,6 +95,15 @@ sudo cat /run/tmux-share/.notready-since
 
 A marker that never clears means re-attachment keeps failing — check the journal for the pane ids and for tmux errors. A stale `.notready-since` that predates a long outage is normally cleared by the next successful pass.
 
+**A tap that died behind its own flag.** `#{pane_pipe}` reports that a command was started, not that it is still running. If the filter exits immediately — its interpreter cannot be found, for instance — tmux can go on reporting the pane as piped while nothing reaches the transcript, and a session that looks idle is really unrecorded. The watchdog therefore checks that a filter process for its stamp path exists, and retires and re-attaches a pane whose flag has no process behind it:
+
+```sh
+tmux -S /run/tmux-share/admin.sock list-panes -s -t tmux-hermes -F '#{pane_id} #{pane_pipe}'
+pgrep -af tmux-share-stamp
+```
+
+A `1` with no matching process is the stale case; the next watchdog pass repairs it and logs `no filter is running`.
+
 For a full static health check, including modes, ownership and the stamp filter:
 
 ```sh

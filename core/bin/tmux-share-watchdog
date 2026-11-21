@@ -98,6 +98,26 @@ fi
 failures=0
 fail() { log "$*"; failures=$((failures + 1)); }
 
+# stamp_running: is a filter process for this deployment actually alive?
+#
+# #{pane_pipe} says a pipe was attached, not that its command is still running.
+# When the filter dies the flag can stay set -- a shell that fails to start leaves
+# tmux reporting 1 while nothing writes to the transcript -- and a watchdog that
+# trusts the flag then skips that pane forever. That is exactly how a tap died of
+# an unresolvable interpreter and left a session that looked idle for an hour.
+#
+# PROC_ROOT exists so the test can point this at a fixture.
+stamp_running() {
+    local root=${TMUX_SHARE_PROC_ROOT:-/proc} entry
+    for entry in "$root"/[0-9]*/cmdline; do
+        [ -r "$entry" ] || continue
+        if tr '\0' ' ' < "$entry" 2>/dev/null | grep -qF -- "$STAMP"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 # tmux ARGS...: bounded, with the lock descriptor closed in the child.
 tmux_bounded() {
     "$TIMEOUT" "$TMUX_BOUND" "$TMUX" -S "$SOCK" "$@" 9>&-
@@ -199,6 +219,14 @@ while IFS=' ' read -r pane pipe _; do
             continue
             ;;
     esac
+
+    if [ "$pipe" = 1 ] && ! stamp_running; then
+        # The flag is set but nothing is feeding the transcript. Retire it below
+        # and attach again, rather than treating a dead tap as a healthy one.
+        log "pane $pane reports a pipe but no filter is running; re-attaching"
+        pipe=1
+        rebuild=1
+    fi
 
     if [ "$rebuild" -eq 0 ] && [ "$pipe" = 1 ]; then
         continue

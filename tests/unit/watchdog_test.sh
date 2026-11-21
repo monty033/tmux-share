@@ -32,6 +32,14 @@ STATE=$work/state
 mkdir -p "$STATE"
 LOG=$work/transcript.log
 STAMP=$work/stamp
+# The watchdog asks /proc whether a filter for this stamp path is alive, because
+# #{pane_pipe} can stay 1 after the command has died. The tests point it at a
+# fixture: entry 4242 present = alive, absent = the stale case.
+PROC=$work/proc
+mkdir -p "$PROC"
+export TMUX_SHARE_PROC_ROOT=$PROC
+stamp_alive() { mkdir -p "$PROC/4242"; printf '%s\0' "$STAMP" > "$PROC/4242/cmdline"; }
+stamp_dead() { rm -rf "$PROC/4242"; }
 REBUILD=$work/rebuild
 NRMARK=$work/notready
 UPTIME=$work/uptime
@@ -141,6 +149,7 @@ case $cmd in *">> $LOG"*) r=0 ;; *) r=1 ;; esac
 check "no-pipe pane: recorded command mentions the log" "$r"
 
 # ---- 2. a pane with a pipe is left alone; -o is never passed ---------------
+stamp_alive
 reset "%0${tab}1" "%1${tab}0"
 run_pass
 check "existing pipe: pass exits 0" "$RC"
@@ -149,7 +158,25 @@ check "existing pipe: pass exits 0" "$RC"
 ! has "$STATE/calls.log" ' -o ' && ! has "$SEEN" ' -o '
 check "no -o is ever passed to pipe-pane" "$?"
 
+# ---- 2b. a pipe flag with no live filter is repaired, not trusted -----------
+# #{pane_pipe} only says a command was started. If that command died -- the
+# interpreter was missing, for instance -- the flag can stay set while the
+# transcript gets nothing, and skipping on the flag blinds the tap indefinitely.
+stamp_dead
+reset "%0${tab}1"
+run_pass
+check "dead filter: pass exits 0" "$RC"
+[ "$(attach_count %0)" = 1 ]
+check "dead filter: the pane is attached again" "$?"
+grep -q 'no filter is running' "$errout"
+check "dead filter: the watchdog says so" "$?"
+has "$SEEN" 'pipe-pane -t %0'
+check "dead filter: the stale pipe is retired first" "$?"
+[ "$(pipe_of %0)" = 1 ]
+check "dead filter: the pane ends up tapped" "$?"
+
 # ---- 3. repeat passes are stable -------------------------------------------
+stamp_alive
 reset "%0${tab}0" "%1${tab}0"
 run_pass; run_pass; run_pass
 check "three passes: last exits 0" "$RC"
@@ -159,6 +186,7 @@ check "three passes: still exactly one attach per pane" "$?"
 ! has "$SEEN" ' -o '; check "three passes: no -o" "$?"
 
 # ---- 4. deleted log + live pipe: retire and re-attach ----------------------
+stamp_alive
 reset "%0${tab}1" "%1${tab}1"
 rm -f -- "$LOG"
 run_pass
