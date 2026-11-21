@@ -8,6 +8,8 @@ The tmux server socket lives in the runtime directory owned by the service accou
 
 tmux's own read-only client mode is **not** a boundary. The attach wrapper happily passes `-r` through to tmux, but a read-only client only restricts what the *client* may type; key bindings that call `run-shell` or `if-shell` still execute as the tmux server owner, which here is root. Handing a reader a client, even a read-only one, would hand it root's shell through tmux's configuration. The boundary is the kernel's permission check on the socket, not a tmux option.
 
+For the same reason, the `server-access -a -r <account>` line that `services.tmux-share.serverAccessReadOnly` writes into the tmux configuration is defence in depth and nothing more. While the socket is owner-only, that entry cannot be reached: the account cannot open the socket to be refused by the ACL. It says what the server would allow if the socket's mode were ever widened, and it does not stop `send-keys` from an account that can already connect to the socket. It is not a second boundary, and it must not be read as one.
+
 The transcript is separated from the socket by directory permissions: `/run/tmux-share` is mode 0710 root:tmux-share, so group members can open a path they already know (the transcript) but cannot list the directory to discover what else is there. The advisory lock is deliberately root-only (mode 0600) and lives outside that directory, because `flock` needs only read access and a reader who could open the lock could stall the taps. Nothing is world-readable or world-writable.
 
 ## Who can read the transcript

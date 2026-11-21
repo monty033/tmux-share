@@ -139,6 +139,27 @@
           badUser = withUser { services.tmux-share.user = "bad;name"; };
           # examples/default.nix names hermes-reader as the readerUser.
           sameAsReader = withUser { services.tmux-share.user = "hermes-reader"; };
+          # The five options a deployment may set beyond the ones the module
+          # already had. One system sets all of them at once, and one system
+          # per option sets a value the module must refuse.
+          custom = withUser {
+            services.tmux-share = {
+              unitPrefix = "tmux-admin";
+              terminal = "tmux-256color";
+              historyLimit = 2000;
+              sessionPath = [ "/usr/local/bin" "/usr/bin" "/bin" ];
+              serverAccessReadOnly = "guest";
+            };
+          };
+          # A prefix systemd itself would accept, and the module refuses: the
+          # module's own assertion is what has to catch it.
+          badPrefix = withUser { services.tmux-share.unitPrefix = "tmux:admin"; };
+          badTerminal = withUser { services.tmux-share.terminal = "xterm;evil"; };
+          badHistory = withUser { services.tmux-share.historyLimit = 0; };
+          badPath = withUser { services.tmux-share.sessionPath = [ "/usr/bin;evil" ]; };
+          badAccess = withUser { services.tmux-share.serverAccessReadOnly = "guest;evil"; };
+          # The read-only account is the one that owns the server.
+          accessIsOwner = withUser { services.tmux-share.serverAccessReadOnly = "root"; };
           # The module as it was before the `user` option, frozen in
           # tests/nix/base-module.nix. A default configuration has to render the
           # same text with this one, so a host that never sets `user` is unchanged.
@@ -151,6 +172,12 @@
           # this check from building the packages the units point at: it reads
           # text, it does not run anything.
           unitOf = cfg: name: builtins.unsafeDiscardStringContext cfg.systemd.units.${name}.text;
+          # The text of a unit that may not exist: a unit the module did not
+          # create reads as empty, so a missing one is a FAIL and not a failed
+          # evaluation.
+          unitText = cfg: name:
+            if builtins.hasAttr name cfg.systemd.units then unitOf cfg name else "";
+          hasUnit = cfg: name: builtins.hasAttr name cfg.systemd.units;
           tmpfilesOf = cfg: builtins.unsafeDiscardStringContext (lib.concatStringsSep "\n" cfg.systemd.tmpfiles.rules);
           etcOf = cfg: name: builtins.unsafeDiscardStringContext cfg.environment.etc.${name}.text;
           unit = unitOf c;
@@ -214,6 +241,15 @@
           };
           etcSameAsBase = other: name: etcAttrs other.config name == etcAttrs baseSystem.config name;
           aliceEtc = name: etcAttrs alice.config name;
+          # The files the custom configuration renders: the five units under
+          # their new names, and the tmux configuration with the five settings.
+          customFile = name: body: file "custom-${name}" body;
+          customServer = customFile "server" (unitText custom.config "tmux-admin-server.service");
+          customTap = customFile "tap" (unitText custom.config "tmux-admin-tap.service");
+          customTapTimer = customFile "tap-timer" (unitText custom.config "tmux-admin-tap.timer");
+          customTrim = customFile "trim" (unitText custom.config "tmux-admin-trim.service");
+          customTrimTimer = customFile "trim-timer" (unitText custom.config "tmux-admin-trim.timer");
+          customConf = customFile "conf" (etcOf custom.config "tmux-share/tmux.conf");
         in
         pkgs.runCommand "tmux-share-module-renders" { } ''
           fails=0
@@ -335,6 +371,52 @@
           assert_that user-without-primary-group-rejected ${lib.boolToString (rejects "primary group of services.tmux-share.user cannot be determined" dave)}
           assert_that user-alice-not-rejected-as-undeclared ${lib.boolToString (!(rejects "must be root or an account declared" alice))}
           assert_that user-equal-to-reader-rejected ${lib.boolToString (rejects "must not be the readerUser" sameAsReader)}
+
+          # ---- the five options a deployment may set beyond the old ones ----
+          # A configuration that sets all of them holds together.
+          assert_that custom-config-assertions-hold ${lib.boolToString (holds custom)}
+
+          # ---- the unit prefix ----
+          assert_that unit-prefix-names-the-server ${lib.boolToString (hasUnit custom.config "tmux-admin-server.service")}
+          assert_that unit-prefix-names-the-tap ${lib.boolToString (hasUnit custom.config "tmux-admin-tap.service")}
+          assert_that unit-prefix-names-the-tap-timer ${lib.boolToString (hasUnit custom.config "tmux-admin-tap.timer")}
+          assert_that unit-prefix-names-the-trim ${lib.boolToString (hasUnit custom.config "tmux-admin-trim.service")}
+          assert_that unit-prefix-names-the-trim-timer ${lib.boolToString (hasUnit custom.config "tmux-admin-trim.timer")}
+          # The old names are gone: a host that renames its units must not keep
+          # the old ones, or it runs two servers on one host.
+          refute_that unit-prefix-drops-the-old-names grep -q 'tmux-share-server\.service' ${customServer} ${customTap} ${customTrim}
+          # The watchdog and the trimmer wait for the server under its new name.
+          assert_that unit-prefix-orders-the-tap-after-the-server grep -qx 'After=tmux-admin-server.service' ${customTap}
+          assert_that unit-prefix-orders-the-trim-after-the-server grep -qx 'After=tmux-admin-server.service' ${customTrim}
+          # The default prefix keeps the names the templates in systemd/ use.
+          assert_that unit-prefix-default-keeps-the-names ${lib.boolToString (hasUnit c "tmux-share-server.service" && hasUnit c "tmux-share-trim.timer")}
+          assert_that unit-prefix-invalid-rejected ${lib.boolToString (rejects "services.tmux-share.unitPrefix must be a plain name" badPrefix)}
+
+          # ---- the terminal type ----
+          assert_that terminal-writes-default-terminal grep -qx 'set -g default-terminal tmux-256color' ${customConf}
+          # The default writes nothing: the module has never written one, and a
+          # deployment that sets nothing must render what it rendered before.
+          refute_that terminal-default-writes-nothing grep -q 'default-terminal' ${tmuxConf}
+          assert_that terminal-invalid-rejected ${lib.boolToString (rejects "services.tmux-share.terminal must be null or a plain terminal name" badTerminal)}
+
+          # ---- the history limit ----
+          assert_that history-limit-writes-history-limit grep -qx 'set -g history-limit 2000' ${customConf}
+          refute_that history-limit-default-writes-nothing grep -q 'history-limit' ${tmuxConf}
+          assert_that history-limit-not-positive-rejected ${lib.boolToString (rejects "services.tmux-share.historyLimit must be null or a positive integer" badHistory)}
+
+          # ---- the session's PATH ----
+          assert_that session-path-writes-set-environment grep -qx 'set-environment -g PATH "/usr/local/bin:/usr/bin:/bin"' ${customConf}
+          refute_that session-path-default-writes-nothing grep -q 'set-environment' ${tmuxConf}
+          assert_that session-path-invalid-rejected ${lib.boolToString (rejects "services.tmux-share.sessionPath must be null or a non-empty list" badPath)}
+
+          # ---- the read-only server access ----
+          assert_that server-access-writes-the-account grep -qx 'server-access -a -r guest' ${customConf}
+          refute_that server-access-default-writes-nothing grep -q 'server-access' ${tmuxConf}
+          assert_that server-access-invalid-rejected ${lib.boolToString (rejects "services.tmux-share.serverAccessReadOnly must be null or a plain account name" badAccess)}
+          assert_that server-access-not-the-owner-rejected ${lib.boolToString (rejects "must not be the account that owns the server" accessIsOwner)}
+
+          # The custom configuration writes the five settings and nothing else.
+          refute_that custom-conf-no-other-settings grep -Ev '^(# |$|set -g (exit-empty|default-shell|default-terminal|history-limit) |server-access -a -r [A-Za-z0-9_.-]+$|set-environment -g PATH "[^"]+"$|new-session -d -s [A-Za-z0-9_-]+ -c /root$)' ${customConf}
 
           if [ "$fails" -ne 0 ]; then
             echo "module-renders: $fails assertion(s) failed" >&2

@@ -12,6 +12,10 @@
 #                                       the same shape tmux-share-render prints
 #   the server's -f file                /etc/tmux-share/tmux.conf (environment.etc)
 #
+# The names of the five units follow services.tmux-share.unitPrefix. The
+# default prefix is the one the templates in systemd/ use, so a host that sets
+# nothing renders the units it rendered before.
+#
 # Import through the flake (nixosModules.default). The module takes the flake
 # as an argument so that the `package` option defaults to this flake's build:
 #   import ./nix/module.nix { inherit self; }
@@ -47,6 +51,20 @@ let
 
   tmuxConf = "/etc/tmux-share/tmux.conf";
   envFile = "/etc/tmux-share/env";
+
+  # The name of the server unit, from the prefix. The default prefix is the
+  # one the templates in systemd/ use, so a host that sets nothing renders the
+  # same unit names; a host whose deployment already runs under another name
+  # says so, and the units it manages are renamed with it. The watchdog and
+  # the trimmer are ordered behind this one.
+  serverUnit = "${cfg.unitPrefix}-server.service";
+
+  # The PATH the session's shells get, the way tmux's set-environment takes
+  # it: one string, the directories joined by ":". Every entry has passed the
+  # assertion below, so none of them holds a quote, a space or a semicolon.
+  sessionPathText =
+    if cfg.sessionPath == null then ""
+    else lib.concatStringsSep ":" cfg.sessionPath;
 
   # The primary group of `user`, read from the account's declaration. The lock
   # is owned by that group because that is the group tmux and the scripts give
@@ -129,6 +147,41 @@ let
       # tmux-share, so a global option cannot leak into anyone else's tmux.
       set -g default-shell ${cfg.shell}
     '')
+    (lib.optionalString (cfg.terminal != null) ''
+
+      # TRAP: default-terminal. The type the shells announce decides what they
+      # can draw: a type the host's terminfo does not have means no colours
+      # and no keypad in every pane the operator opens. -g is deliberate, as
+      # above: this server is dedicated to tmux-share.
+      set -g default-terminal ${cfg.terminal}
+    '')
+    (lib.optionalString (cfg.historyLimit != null) ''
+
+      # TRAP: history-limit. The scroll-back buffer is what the operator reads
+      # after a long command; tmux's own 2000 lines are often shorter than the
+      # output they want to scroll back through, and a bigger buffer costs
+      # memory in every pane they open.
+      set -g history-limit ${toString cfg.historyLimit}
+    '')
+    (lib.optionalString (cfg.serverAccessReadOnly != null) ''
+
+      # TRAP: server-access. Defence in depth, and only that: while the socket
+      # is owner-only this entry cannot be reached, and it does not stop
+      # send-keys from an account that can already connect to the socket. It
+      # says what the server would allow if the socket's mode were widened.
+      server-access -a -r ${cfg.serverAccessReadOnly}
+    '')
+    (lib.optionalString (cfg.sessionPath != null) ''
+
+      # TRAP: the session's PATH. The shells inside the session inherit the
+      # environment of the account running the server, which is not the
+      # operator's login PATH, so a session that cannot find the operator's
+      # tools is a session the operator has to fix by hand every time. The
+      # value is the whole PATH, so it replaces the inherited one instead of
+      # adding to it, and it is set before the session is created so that the
+      # session's shells get it.
+      set-environment -g PATH "${sessionPathText}"
+    '')
     ''
 
       # Created at server start, so the transcript tap and the operator's attach
@@ -140,6 +193,23 @@ in
 {
   options.services.tmux-share = {
     enable = mkEnableOption "the tmux-share dedicated tmux server, with its transcript tap, watchdog and trimmer";
+
+    unitPrefix = mkOption {
+      type = types.str;
+      default = "tmux-share";
+      description = ''
+        Prefix of the names of the five systemd units: <prefix>-server.service,
+        <prefix>-tap.service, <prefix>-tap.timer, <prefix>-trim.service and
+        <prefix>-trim.timer. The default keeps the names the templates in
+        systemd/ use, so a host that sets nothing renders the units it
+        rendered before; a host whose deployment already runs the feature
+        under another name (the live host uses "tmux-admin") sets this to keep
+        its own names. The software is tmux-share whatever the units are
+        called.
+        A plain name ([A-Za-z0-9_][A-Za-z0-9_.-]*): it names systemd units,
+        where a space or a ';' would change what they mean.
+      '';
+    };
 
     sessionName = mkOption {
       type = types.str;
@@ -222,6 +292,70 @@ in
       '';
     };
 
+    terminal = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      description = ''
+        Terminal type the shells inside the session announce (tmux
+        default-terminal), for example "tmux-256color". null writes nothing,
+        so tmux keeps its own default: this module has never written a
+        default-terminal, and writing one now would change the rendered file
+        of every deployment that exists. The live host sets "tmux-256color".
+        A plain name ([A-Za-z0-9_][A-Za-z0-9_.-]*): it is written into the tmux
+        configuration, where a ';' would start another tmux command.
+      '';
+    };
+
+    historyLimit = mkOption {
+      type = types.nullOr types.int;
+      default = null;
+      description = ''
+        Number of lines the session's scroll-back buffer keeps (tmux
+        history-limit). null writes nothing, so tmux keeps its own default of
+        2000 lines: this module has never written a history-limit, and writing
+        one now would change the rendered file of every deployment that
+        exists. The live host sets 2000, which is that same default.
+        A positive integer: the option names a bound on the scroll-back
+        buffer, and zero is not a bound.
+      '';
+    };
+
+    sessionPath = mkOption {
+      type = types.nullOr (types.listOf types.str);
+      default = null;
+      description = ''
+        PATH the shells inside the session get, as a list of absolute
+        directories, for example [ "/usr/local/bin" "/usr/bin" "/bin" ]. The
+        module writes them joined by ":" into the tmux configuration, as
+        "set-environment -g PATH", so the session's shells get exactly that
+        PATH and not the one the account running the server happens to have.
+        null writes nothing, and the shells inherit the server's PATH as they
+        do today. The live host sets the PATH its operators expect.
+        Every entry must be an absolute path with only A-Z a-z 0-9 _ . / -
+        characters: the value is written into the tmux configuration, where a
+        ';' would start another tmux command.
+      '';
+    };
+
+    serverAccessReadOnly = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      description = ''
+        An account tmux's server-access list gets read-only access to: the
+        module writes "server-access -a -r <account>" into the tmux
+        configuration. Defence in depth, and nothing more: while the socket is
+        owner-only the entry cannot be reached, and it does not stop
+        send-keys from an account that can already connect to the socket. It
+        says what the server would allow if the socket's mode were ever
+        widened; it is not a second boundary, and it does not replace the
+        socket's mode. null writes no entry at all. The live host names the
+        account that may attach read-only.
+        A plain account name ([A-Za-z0-9_][A-Za-z0-9_.-]*), and not the
+        account that owns the server: an account cannot be both the owner of
+        the socket and a read-only guest of it.
+      '';
+    };
+
     package = mkOption {
       type = types.package;
       default = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
@@ -236,6 +370,13 @@ in
         {
           assertion = matches sessionRe cfg.sessionName;
           message = "services.tmux-share.sessionName must match ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$; it is written into tmux commands, where a ';' or a quote would run as a tmux command.";
+        }
+        {
+          # The prefix names the five units. A unit name systemd cannot make
+          # is a unit that never starts, and the operator is left with a
+          # feature that is not running and no error.
+          assertion = matches nameRe cfg.unitPrefix;
+          message = "services.tmux-share.unitPrefix must be a plain name ([A-Za-z0-9_][A-Za-z0-9_.-]*): it names the systemd units (<prefix>-server.service and the rest), where a space or a ';' would change what they mean.";
         }
         {
           assertion = cfg.readerUser != "root";
@@ -298,6 +439,32 @@ in
           assertion = cfg.shell == null || matches pathRe cfg.shell;
           message = "services.tmux-share.shell must be null or an absolute path with only A-Z a-z 0-9 _ . / - characters: it is written into the tmux configuration, where a ';' would start another tmux command.";
         }
+        {
+          assertion = cfg.terminal == null || matches nameRe cfg.terminal;
+          message = "services.tmux-share.terminal must be null or a plain terminal name ([A-Za-z0-9_][A-Za-z0-9_.-]*): it is written into the tmux configuration, where a ';' would start another tmux command.";
+        }
+        {
+          assertion = cfg.historyLimit == null || cfg.historyLimit > 0;
+          message = "services.tmux-share.historyLimit must be null or a positive integer: the option names a bound on the scroll-back buffer, and zero is not a bound; the module writes the value into the tmux configuration.";
+        }
+        {
+          # Every entry of the PATH, one by one. The value is joined and
+          # written into the tmux configuration as one string, so a single
+          # entry with a ';' in it would start another tmux command.
+          assertion = cfg.sessionPath == null || (cfg.sessionPath != [] && lib.all (p: matches pathRe p) cfg.sessionPath);
+          message = "services.tmux-share.sessionPath must be null or a non-empty list of absolute paths with only A-Z a-z 0-9 _ . / - characters: the value is written into the tmux configuration, where a ';' would start another tmux command.";
+        }
+        {
+          assertion = cfg.serverAccessReadOnly == null || matches nameRe cfg.serverAccessReadOnly;
+          message = "services.tmux-share.serverAccessReadOnly must be null or a plain account name ([A-Za-z0-9_][A-Za-z0-9_.-]*): it is written into the tmux configuration, where a ';' would start another tmux command.";
+        }
+        {
+          # The owner of the server is already allowed everything the server
+          # allows; giving it a read-only entry as well says nothing and
+          # hides the one account that must never be a guest.
+          assertion = cfg.serverAccessReadOnly == null || cfg.serverAccessReadOnly != cfg.user;
+          message = "services.tmux-share.serverAccessReadOnly must not be the account that owns the server (services.tmux-share.user): an account cannot be both the owner of the socket and a read-only guest of it.";
+        }
       ];
     }
 
@@ -338,7 +505,7 @@ in
         # and any mode wider than tmux's own would undo the boundary.
       ];
 
-      systemd.services.tmux-share-server = {
+      systemd.services."${cfg.unitPrefix}-server" = {
         description = "tmux-share dedicated tmux server";
         # TRAP: order after tmpfiles. It creates the 0710 directory the socket
         # lives in; without the ordering the server can start before it exists.
@@ -368,11 +535,11 @@ in
         };
       };
 
-      systemd.services.tmux-share-tap = {
+      systemd.services."${cfg.unitPrefix}-tap" = {
         description = "tmux-share watchdog (keeps the transcript tap attached)";
         # Ordered behind the server, but no Requires/Wants: a pass never starts or
         # restarts the server.
-        after = [ "tmux-share-server.service" ];
+        after = [ serverUnit ];
         serviceConfig = runAs // {
           # TRAP: oneshot with RemainAfterExit=no. A oneshot left active is never
           # started again by its timer, so the watchdog would run once and stop.
@@ -384,7 +551,7 @@ in
         };
       };
 
-      systemd.timers.tmux-share-tap = {
+      systemd.timers."${cfg.unitPrefix}-tap" = {
         description = "Run the tmux-share watchdog every 20 seconds";
         wantedBy = [ "timers.target" ];
         timerConfig = {
@@ -398,9 +565,9 @@ in
         };
       };
 
-      systemd.services.tmux-share-trim = {
+      systemd.services."${cfg.unitPrefix}-trim" = {
         description = "tmux-share transcript trimmer";
-        after = [ "tmux-share-server.service" ];
+        after = [ serverUnit ];
         serviceConfig = runAs // {
           # TRAP: the same oneshot rule as the watchdog (RemainAfterExit=no).
           Type = "oneshot";
@@ -410,7 +577,7 @@ in
         };
       };
 
-      systemd.timers.tmux-share-trim = {
+      systemd.timers."${cfg.unitPrefix}-trim" = {
         description = "Run the tmux-share transcript trimmer every five minutes";
         wantedBy = [ "timers.target" ];
         timerConfig = {

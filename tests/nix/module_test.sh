@@ -73,6 +73,31 @@ user-undeclared-explains-boot-failure
 user-without-primary-group-rejected
 user-alice-not-rejected-as-undeclared
 user-equal-to-reader-rejected
+custom-config-assertions-hold
+unit-prefix-names-the-server
+unit-prefix-names-the-tap
+unit-prefix-names-the-tap-timer
+unit-prefix-names-the-trim
+unit-prefix-names-the-trim-timer
+unit-prefix-drops-the-old-names
+unit-prefix-orders-the-tap-after-the-server
+unit-prefix-orders-the-trim-after-the-server
+unit-prefix-default-keeps-the-names
+unit-prefix-invalid-rejected
+terminal-writes-default-terminal
+terminal-default-writes-nothing
+terminal-invalid-rejected
+history-limit-writes-history-limit
+history-limit-default-writes-nothing
+history-limit-not-positive-rejected
+session-path-writes-set-environment
+session-path-default-writes-nothing
+session-path-invalid-rejected
+server-access-writes-the-account
+server-access-default-writes-nothing
+server-access-invalid-rejected
+server-access-not-the-owner-rejected
+custom-conf-no-other-settings
 '
 
 if ! command -v nix >/dev/null 2>&1; then

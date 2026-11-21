@@ -11,8 +11,12 @@
 # equal the values taken before the change, or the run fails and keeps the
 # scratch directory for manual recovery.
 #
-# The tree must be clean when the run starts, and it is checked again at the
-# end: any tracked change left behind is printed and fails the run.
+# The tree does not have to be clean when the run starts. This suite exists to
+# prove that the checks can fail, and it is run against a tree that holds the
+# change it is testing; a change that is not committed yet is the normal case
+# for it. What the run must guarantee is that it leaves the tree as it found
+# it: the state of every tracked file is taken before the first mutation and
+# compared with the state after the last one, and any difference fails the run.
 #
 # Scratch files live in a mktemp directory under TMPDIR, as the other suites
 # do. Nothing else is written.
@@ -39,14 +43,6 @@ export PATH
 . "$repo_root/core/lib/checks.sh"
 
 cd -- "$repo_root" || exit 1
-
-# Refuse to start on a dirty tree: the final diff check could not tell our
-# changes from someone else's.
-if ! git diff --quiet; then
-    echo 'mutation: refusing to start, tracked files already differ:' >&2
-    git diff --stat >&2
-    exit 1
-fi
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/mutation-test.XXXXXX") || exit 1
 restore_bad=0
@@ -89,6 +85,22 @@ PY
 sha256_of() {
     sha256sum -- "$1" | cut -d' ' -f1
 }
+
+# tree_state: one digest of every tracked file's content and mode. The run
+# must not change any of them, so the state before the first mutation and the
+# state after the last one have to be the same.
+tree_state() {
+    git ls-files -z | while IFS= read -r -d '' f; do
+        if [ -e "$f" ]; then
+            printf '%s %s %s\n' "$f" "$(sha256_of "$f")" "$(stat -c '%a' -- "$f")"
+        else
+            printf '%s MISSING\n' "$f"
+        fi
+    done | sha256sum | cut -d' ' -f1
+}
+
+# The state the tree is in before anything is mutated.
+start_state=$(tree_state)
 
 # edit_file FILE OLD NEW: the mutator for text changes.
 edit_file() {
@@ -311,13 +323,53 @@ mutate_case 'install: an inherited TMUX_SHARE_USER reaches the env file' \
     tests/install/install_test.sh install.sh edit_file \
     'export TMUX_SHARE_USER=$user' ':'
 
+# ---- the five options the module gained -------------------------------------
+# Each one names a value that reaches a systemd unit or a tmux command, so
+# each one is a way for a name, a PATH or an account to be wrong.
+
+mutate_case 'module: the unit prefix is ignored' \
+    tests/nix/module_test.sh nix/module.nix edit_file \
+    'systemd.services."${cfg.unitPrefix}-server" = {' \
+    'systemd.services."tmux-share-server" = {'
+
+mutate_case 'module: an invalid unit prefix is accepted' \
+    tests/nix/module_test.sh nix/module.nix edit_file \
+    'assertion = matches nameRe cfg.unitPrefix;' \
+    'assertion = true;'
+
+mutate_case 'module: a PATH entry carrying a semicolon is accepted' \
+    tests/nix/module_test.sh nix/module.nix edit_file \
+    'assertion = cfg.sessionPath == null || (cfg.sessionPath != [] && lib.all (p: matches pathRe p) cfg.sessionPath);' \
+    'assertion = cfg.sessionPath == null || (cfg.sessionPath != [] && true);'
+
+mutate_case 'module: server-access names the owner instead of the read-only account' \
+    tests/nix/module_test.sh nix/module.nix edit_file \
+    'server-access -a -r ${cfg.serverAccessReadOnly}' \
+    'server-access -a -r ${cfg.user}'
+
+mutate_case 'module: the owner of the server is accepted as a read-only guest' \
+    tests/nix/module_test.sh nix/module.nix edit_file \
+    'assertion = cfg.serverAccessReadOnly == null || cfg.serverAccessReadOnly != cfg.user;' \
+    'assertion = true;'
+
+mutate_case 'module: the terminal is never written' \
+    tests/nix/module_test.sh nix/module.nix edit_file \
+    '(lib.optionalString (cfg.terminal != null) ' \
+    '(lib.optionalString (cfg.terminal != null && false) '
+
+mutate_case 'module: a history limit of zero is accepted' \
+    tests/nix/module_test.sh nix/module.nix edit_file \
+    'assertion = cfg.historyLimit == null || cfg.historyLimit > 0;' \
+    'assertion = cfg.historyLimit == null;'
+
 check_summary
 summary=$?
 
-if ! git diff --quiet; then
-    echo 'mutation: tracked files differ after the run:'
-    git diff
+if [ "$(tree_state)" != "$start_state" ]; then
+    echo 'mutation: the tree differs after the run:'
+    git status --porcelain=v1 --untracked-files=no
+    git diff --stat
     exit 1
 fi
-echo 'tree: clean (git diff --quiet)'
+echo "tree: unchanged by this run (state $start_state)"
 exit "$summary"
