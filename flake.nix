@@ -70,6 +70,9 @@
         in
         pkgs.runCommand "tmux-share-unstable"
           {
+            # patchShebangs rewrites a shebang only when the interpreter is on the
+            # builder's PATH, so python3 has to be here as well as in runtimePath.
+            nativeBuildInputs = [ pkgs.python3 ];
             meta = {
               description = "tmux-share: transcript-recording tmux server with a read-only reader group";
               platforms = lib.platforms.linux;
@@ -83,8 +86,21 @@
             chmod 0755 "$core"/bin/* "$core/tmux-share-stamp"
             chmod 0644 "$core"/lib/*
             # The scripts and the stamp filter start with "#!/usr/bin/env ...".
-            # NixOS-independent: the shebangs point at the store's interpreters.
+            # patchShebangs only rewrites an interpreter it can find in PATH at
+            # build time, so python3 must be a build input and not merely a
+            # runtime one: the stamp shipped as "#!/usr/bin/env python3", and the
+            # tmux session's PATH has no python3, so every tap died on attach.
             patchShebangs "$core/bin" "$core/tmux-share-stamp"
+            # Prove it rather than assume it: a shebang still pointing at /usr/bin
+            # or /bin works on the build machine and nowhere else. Only executable
+            # files are checked; the sourced libraries carry a shellcheck shebang
+            # that nothing runs.
+            unresolved=$(find "$out" -type f -perm -u+x -exec grep -lE '^#!/(usr/)?bin/env ' {} + || true)
+            if [ -n "$unresolved" ]; then
+                echo "these executables keep an unresolved env shebang:" >&2
+                echo "$unresolved" >&2
+                exit 1
+            fi
             ${lib.concatMapStrings mkWrapper scripts}
           '';
 
