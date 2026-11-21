@@ -198,14 +198,19 @@ mutate_case 'watchdog: pipe-pane -o re-added is caught' \
     tests/unit/watchdog_test.sh core/bin/tmux-share-watchdog edit_file \
     'pipe-pane -t "$pane" "$cmd"' 'pipe-pane -o -t "$pane" "$cmd"'
 
-mutate_case 'tap: the transcript is created with the caller umask' \
-    tests/unit/tap_start_test.sh core/bin/tmux-share-tap-start edit_file \
-    '( umask 027; : >> "$LOG" )' '( umask 022; : >> "$LOG" )'
+mutate_case 'transcript helper: an unreadable file is accepted' \
+    tests/unit/tap_start_test.sh core/lib/transcript.sh edit_file \
+    '            TRANSCRIPT_REASON="$file has mode $mode; the reader group has no read access"
+            return 1' \
+    '            :'
 
-mutate_case 'tap: an unreadable transcript no longer stops the tap' \
-    tests/unit/tap_start_test.sh core/bin/tmux-share-tap-start edit_file \
-    '*) die "log $LOG has mode $log_mode; the reader group has no read access" ;;' \
-    '*) : ;;'
+mutate_case 'transcript helper: the file is created with the caller umask' \
+    tests/unit/tap_start_test.sh core/lib/transcript.sh edit_file \
+    '( umask 027; : >> "$file" )' '( umask 022; : >> "$file" )'
+
+mutate_case 'watchdog: the transcript is left to the attach redirection' \
+    tests/unit/watchdog_test.sh core/bin/tmux-share-watchdog edit_file \
+    'if ! ensure_transcript "$DIR" "$LOG"; then' 'if false; then'
 
 mutate_case 'server unit: ExecStartPost loses its leading -' \
     tests/systemd/units_test.sh systemd/tmux-share-server.service edit_file \

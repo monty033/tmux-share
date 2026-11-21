@@ -172,6 +172,13 @@ grep -q 'marker=present args=pipe-pane -t %0 exec ' "$SEEN"
 check "deleted log: re-attach happened while the marker existed" "$?"
 [ ! -e "$REBUILD" ]; check "deleted log: rebuild marker cleared after success" "$?"
 [ -e "$LOG" ]; check "deleted log: log file recreated by the attach" "$?"
+# Recreated here, not by the attach redirection: that would leave the caller's
+# group and umask on a file whose whole contract is "the reader group can read it,
+# and nobody else can".
+[ "$(stat -c %a "$LOG")" = 640 ]
+check "deleted log: recreated with mode 0640" "$?"
+[ "$(stat -c %G "$LOG")" = "$(stat -c %G "$TMUX_SHARE_DIR")" ]
+check "deleted log: recreated in the runtime directory's group" "$?"
 run_pass
 check "deleted log: following pass exits 0" "$RC"
 [ "$(attach_count %0)" = 1 ]; check "deleted log: following pass attaches nothing more" "$?"

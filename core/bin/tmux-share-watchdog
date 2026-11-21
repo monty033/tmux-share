@@ -54,6 +54,8 @@ TMUX_BOUND=5
 . "$LIBDIR/validate.sh"
 # shellcheck source=../lib/notready.sh
 . "$LIBDIR/notready.sh"
+# shellcheck source=../lib/transcript.sh
+. "$LIBDIR/transcript.sh"
 
 log() { printf 'tmux-share-watchdog: %s\n' "$*" >&2; }
 die() { log "$*"; exit "${2:-1}"; }
@@ -173,6 +175,14 @@ if ! server_ready; then
 fi
 
 # ---- 4. attach / rebuild per pane ------------------------------------------
+# The attach command below redirects into $LOG, so a missing transcript would be
+# created by that redirection with this process's umask and group: mode 0644 and
+# root:root on a root deployment. That is not the contract (0640, reader group),
+# so the file is established first and the attach is refused if it cannot be.
+if ! ensure_transcript "$DIR" "$LOG"; then
+    die "cannot give the reader a readable transcript: $TRANSCRIPT_REASON"
+fi
+
 cmd="exec $STAMP >> $LOG"
 attached=0
 
